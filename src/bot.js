@@ -18,15 +18,14 @@ const { fightMobs } = require("./actions/combat");
 const gather = require("./actions/gather");
 
 // ---- Controls ----
-const AUTONOMY_INTERVAL_MS = 5 * 60 * 1000; // at most one autonomous LLM plan per 5 min per bot
+const AUTONOMY_INTERVAL_MS = 5 * 60 * 1000;
 const TASK_TICK_MS = 1500;
 const COOLDOWN_ON_HUMAN_MS = 1500;
 const WANDER_RADIUS = 10;
 
 // ---- Team influence controls ----
 const TEAM_PREFIX = "[TEAM]";
-const TEAM_EVENT_RATE_MS = 2500; // avoid team spam
-const MAX_BOT_CHAT_ECHO = 0;     // keep 0 to avoid bot-to-bot echo chains
+const TEAM_EVENT_RATE_MS = 2500;
 
 function clampChat(s) {
   return String(s || "").replace(/\s+/g, " ").trim().slice(0, 220);
@@ -51,10 +50,9 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
 
   bot._lastAutonomyAt = 0;
   bot._lastHumanAt = 0;
-
   bot._lastTeamEventAt = 0;
 
-  // Optional: safe chat throttle (helps avoid server spam rules)
+  // Basic chat throttle (helps avoid spam rules)
   bot._lastChatAt = 0;
   function safeChat(msg) {
     const t = Date.now();
@@ -74,14 +72,12 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
 
     safeChat(`(${bot.username}) online. @mention me.`);
 
-    // light activity
     bot._planQueue = [{ type: "WANDER" }];
     wander(bot, WANDER_RADIUS);
 
-    // Task loop
     setInterval(() => tick(bot), TASK_TICK_MS);
 
-    // Autonomy loop (LLM max once/5min/bot)
+    // Autonomy loop: LLM max once per 5 min per bot
     setInterval(async () => {
       if (!bot.entity) return;
       if (bot._planning) return;
@@ -92,7 +88,8 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
         const { say, plan } = await planActions({
           systemPrompt: persona.system,
           bot,
-          humanMessage: null
+          humanMessage: null,
+          trigger: "autonomy"
         });
 
         if (say) safeChat(say);
@@ -109,34 +106,29 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
     }, 15000);
   });
 
-  // ✅ Bot-to-bot influence:
-  // - Bots can publish TEAM events by chatting "[TEAM] ..."
-  // - Bot messages do NOT trigger immediate replans (prevents loops)
+  // Chat handling:
+  // - Records TEAM broadcasts from bots/humans
+  // - Human @mention triggers immediate replanning
   bot.on("chat", async (sender, message) => {
     if (sender === bot.username) return;
 
     const isBotSender = allBotNames && allBotNames.has(sender);
 
-    // Record TEAM broadcasts from any sender (human or bot)
+    // Record TEAM broadcasts
     if (String(message).startsWith(TEAM_PREFIX)) {
       const t = Date.now();
       if (t - bot._lastTeamEventAt > TEAM_EVENT_RATE_MS) {
         bot._lastTeamEventAt = t;
-        postEvent(sender, message); // store the whole message (prefix included)
+        postEvent(sender, message);
       }
-      // Important: do not replan off TEAM messages directly
+      // Never replan directly from TEAM messages (prevents loops)
       return;
     }
 
-    // If it's a bot sender and not a TEAM broadcast, ignore to prevent loops
-    if (isBotSender) {
-      if (MAX_BOT_CHAT_ECHO > 0) {
-        // (Optional) could log or react, but default is off
-      }
-      return;
-    }
+    // Ignore non-TEAM bot chatter (prevents bot-to-bot loops)
+    if (isBotSender) return;
 
-    // Human-triggered replanning via @mention (immediate)
+    // Human-triggered replanning
     const mention = `@${bot.username}`;
     if (!message.toLowerCase().startsWith(mention.toLowerCase())) return;
 
@@ -152,7 +144,8 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
       const { say, plan } = await planActions({
         systemPrompt: persona.system,
         bot,
-        humanMessage: humanText
+        humanMessage: humanText,
+        trigger: "human"
       });
 
       safeChat(say || "Got it.");
@@ -229,7 +222,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
         bot._current = null;
 
       } else if (type === "BUILD_STRUCTURE") {
-        await buildFort(bot); // starter: treat all kinds as fort
+        await buildFort(bot);
         const p = bot.entity.position.floored();
         postEvent(bot.username, `${TEAM_PREFIX} Built structure near ${p.x} ${p.y} ${p.z}`);
         bot._planQueue.shift();

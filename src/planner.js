@@ -1,12 +1,20 @@
 // src/planner.js
 require("dotenv").config();
-const OpenAI = require("openai");
 const { recentEvents } = require("./team_bus");
-
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const { logPlan } = require("./llm_logger");
 
 const MODEL = "gpt-5-mini";
 const MAX_OUTPUT_TOKENS = 420;
+
+// Cache the OpenAI client (loaded via dynamic import so CJS can use ESM deps)
+let _client = null;
+async function getClient() {
+  if (_client) return _client;
+  const mod = await import("openai"); // <-- ESM-safe from CommonJS
+  const OpenAI = mod.default || mod.OpenAI || mod;
+  _client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _client;
+}
 
 function clampChat(s) {
   return String(s || "").replace(/\s+/g, " ").trim().slice(0, 220);
@@ -14,9 +22,11 @@ function clampChat(s) {
 
 /**
  * Returns: { say: string, plan: Array<Action> }
- * Action is a JSON object with a "type" field matching the allowed actions.
+ * Adds JSONL logging of raw LLM output + parse errors + normalized plan.
  */
-async function planActions({ systemPrompt, bot, humanMessage }) {
+async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonomy" }) {
+  const client = await getClient();
+
   const pos = bot.entity?.position;
   const isNight = bot.time?.isNight ?? false;
 
@@ -45,43 +55,92 @@ async function planActions({ systemPrompt, bot, humanMessage }) {
     `Rules:`,
     `- Never grief: do NOT break or destroy player-built structures or steal items.`,
     `- Avoid harm: no explicit violence threats or harassment.`,
-    `- Prefer safe behavior at night: return to base, build defenses, light areas, or brief wander.`,
+    `- Prefer safe behavior at night: return to base, build defenses, or brief wander.`,
     `- Keep "say" brief and in-character.`,
   ];
 
-  if (pos) menu.push(`State: pos=${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)} health=${bot.health} food=${bot.food} night=${isNight}`);
+  if (pos) {
+    menu.push(
+      `State: pos=${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)} health=${bot.health} food=${bot.food} night=${isNight}`
+    );
+  }
 
-  // ✅ Bot-to-bot influence: include recent team updates (last ~10 minutes)
+  // Team influence context
   const ev = recentEvents(10 * 60 * 1000, 12);
   if (ev.length) {
-    menu.push("", "Recent TEAM updates (incorporate them if useful):");
-    for (const e of ev) {
-      menu.push(`- ${e.from}: ${e.text}`);
-    }
+    menu.push("", "Recent TEAM updates (incorporate if useful):");
+    for (const e of ev) menu.push(`- ${e.from}: ${e.text}`);
   }
 
   if (humanMessage) menu.push("", `Human said: "${humanMessage}"`);
 
-  const resp = await client.responses.create({
-    model: MODEL,
-    input: [
-      { role: "system", content: String(systemPrompt || "").trim() },
-      { role: "user", content: menu.join("\n") }
-    ],
-    max_output_tokens: MAX_OUTPUT_TOKENS
-  });
+  const systemStr = String(systemPrompt || "").trim();
+  const menuStr = menu.join("\n");
 
-  const text = (resp.output_text || "").trim();
+  let resp;
+  let text = "";
+
+  try {
+    resp = await client.responses.create({
+      model: MODEL,
+      input: [
+        { role: "system", content: systemStr },
+        { role: "user", content: menuStr }
+      ],
+      max_output_tokens: MAX_OUTPUT_TOKENS
+    });
+
+    text = (resp.output_text || "").trim();
+
+    logPlan({
+      bot: bot.username,
+      trigger,
+      model: MODEL,
+      output_text: text,
+      usage: resp.usage || null,
+      request: {
+        system: systemStr.slice(0, 2000),
+        user: humanMessage ? String(humanMessage).slice(0, 500) : null,
+        menu: menuStr.slice(0, 4000),
+      }
+    });
+  } catch (err) {
+    logPlan({
+      bot: bot.username,
+      trigger,
+      model: MODEL,
+      request_error: String(err?.message || err),
+      request: {
+        system: systemStr.slice(0, 2000),
+        user: humanMessage ? String(humanMessage).slice(0, 500) : null,
+        menu: menuStr.slice(0, 4000),
+      }
+    });
+    throw err;
+  }
 
   let obj;
   try {
     obj = JSON.parse(text);
-  } catch {
+  } catch (err) {
+    logPlan({
+      bot: bot.username,
+      trigger,
+      model: MODEL,
+      parse_error: String(err?.message || err),
+      output_text: text
+    });
     return { say: "", plan: [{ type: "WANDER" }] };
   }
 
   const say = obj?.say ? clampChat(obj.say) : "";
   const plan = Array.isArray(obj?.plan) ? obj.plan.slice(0, 3) : [{ type: "WANDER" }];
+
+  logPlan({
+    bot: bot.username,
+    trigger,
+    normalized: { say, plan }
+  });
 
   return { say, plan };
 }
