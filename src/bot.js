@@ -9,6 +9,7 @@ const toolPlugin = require("mineflayer-tool").plugin;
 
 const { planActions } = require("./planner");
 const { postEvent } = require("./team_bus");
+const { pushMessage } = require("./inbox");
 
 const { goto, follow, wander, tickMovement } = require("./actions/movement");
 const { getBase, setBase } = require("./actions/memory");
@@ -26,6 +27,12 @@ const WANDER_RADIUS = 10;
 // ---- Team influence controls ----
 const TEAM_PREFIX = "[TEAM]";
 const TEAM_EVENT_RATE_MS = 2500;
+
+// ---- Bot-to-bot DM + social ping ----
+const ENABLE_SOCIAL_PING = (process.env.BOT_SOCIAL_PING || "1") === "1";
+const SOCIAL_PING_INTERVAL_MS = parseInt(process.env.BOT_SOCIAL_PING_INTERVAL_MS || "60000", 10);
+const SOCIAL_PING_PROB = parseFloat(process.env.BOT_SOCIAL_PING_PROB || "0.15"); // 0..1
+const BOT_DM_RATE_MS = parseInt(process.env.BOT_DM_RATE_MS || "15000", 10); // per bot: max 1 dm/15s
 
 function clampChat(s) {
   return String(s || "").replace(/\s+/g, " ").trim().slice(0, 220);
@@ -51,6 +58,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
   bot._lastAutonomyAt = 0;
   bot._lastHumanAt = 0;
   bot._lastTeamEventAt = 0;
+  bot._lastDmAt = 0;
 
   // Chat throttle (avoid spam kicks)
   bot._lastChatAt = 0;
@@ -77,7 +85,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
 
     setInterval(() => tick(bot), TASK_TICK_MS);
 
-    // Autonomy loop: LLM max once per 5 min per bot
+    // Autonomy loop: LLM max once/5 min/bot
     setInterval(async () => {
       if (!bot.entity) return;
       if (bot._planning) return;
@@ -92,7 +100,6 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
           trigger: "autonomy"
         });
 
-        // If model didn't provide say, don’t spam chat; just execute plan
         if (say) safeChat(say);
 
         bot.pathfinder.setGoal(null);
@@ -105,11 +112,31 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
         bot._planning = false;
       }
     }, 15000);
+
+    // ✅ Social ping loop: bots initiate DMs without humans
+    if (ENABLE_SOCIAL_PING) {
+      setInterval(() => {
+        try {
+          if (!bot.entity) return;
+          if (bot._planning || bot._executing) return;
+          if (Math.random() > SOCIAL_PING_PROB) return;
+
+          const others = allBotNames ? Array.from(allBotNames).filter(n => n !== bot.username) : [];
+          if (!others.length) return;
+
+          const target = others[Math.floor(Math.random() * others.length)];
+
+          // DM rate limit per bot
+          const now = Date.now();
+          if (now - bot._lastDmAt < BOT_DM_RATE_MS) return;
+          bot._lastDmAt = now;
+
+          safeChat(`@${target} status check — what are you working on?`);
+        } catch {}
+      }, SOCIAL_PING_INTERVAL_MS);
+    }
   });
 
-  // Chat handling:
-  // - Records TEAM broadcasts from bots/humans
-  // - Human @mention triggers immediate replanning
   bot.on("chat", async (sender, message) => {
     if (sender === bot.username) return;
 
@@ -125,12 +152,23 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
       return; // never replan directly from TEAM messages
     }
 
-    // Ignore non-TEAM bot chatter
-    if (isBotSender) return;
+    const mention = `@${bot.username}`;
+    const isMentionToMe = message.toLowerCase().startsWith(mention.toLowerCase());
+
+    // ✅ Bot-to-bot DMs: if another bot @mentions me, put it in my inbox.
+    // Do NOT trigger immediate replanning (prevents loops).
+    if (isBotSender) {
+      if (isMentionToMe) {
+        const dmText = message.slice(mention.length).trim();
+        pushMessage(bot.username, sender, dmText);
+        // Optional acknowledgement (disabled by default; can cause chatter):
+        // safeChat(`@${sender} got it — I'll respond soon.`);
+      }
+      return;
+    }
 
     // Human-triggered replanning
-    const mention = `@${bot.username}`;
-    if (!message.toLowerCase().startsWith(mention.toLowerCase())) return;
+    if (!isMentionToMe) return;
 
     if (Date.now() - bot._lastHumanAt < COOLDOWN_ON_HUMAN_MS) return;
     bot._lastHumanAt = Date.now();
@@ -148,7 +186,6 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
         trigger: "human"
       });
 
-      // ✅ No more "Got it." fallback
       safeChat(say || `I heard you: "${humanText}". What should I do first?`);
 
       bot.pathfinder.setGoal(null);
@@ -179,7 +216,14 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
 
     try {
       if (type === "SAY") {
-        safeChat(step.text || "");
+        // DM rate limit to avoid bot chatter storms
+        const now = Date.now();
+        const txt = String(step.text || "");
+        const isDm = txt.trim().startsWith("@");
+        if (!isDm || (now - bot._lastDmAt >= BOT_DM_RATE_MS)) {
+          if (isDm) bot._lastDmAt = now;
+          safeChat(txt);
+        }
         bot._planQueue.shift();
         bot._current = null;
 

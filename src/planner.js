@@ -1,12 +1,13 @@
 // src/planner.js
 require("dotenv").config();
 const { recentEvents } = require("./team_bus");
+const { drainMessages } = require("./inbox");
 const { logPlan } = require("./llm_logger");
 
 const MODEL = "gpt-5-mini";
-const MAX_OUTPUT_TOKENS = 520;
+const MAX_OUTPUT_TOKENS = 560;
 
-// Cache OpenAI client via dynamic import so CommonJS can load ESM SDK
+// Cache OpenAI client via dynamic import (CJS compatible with ESM SDK)
 let _client = null;
 async function getClient() {
   if (_client) return _client;
@@ -34,11 +35,6 @@ function summarizeInventory(bot, limit = 12) {
 
 /**
  * Returns: { say: string, plan: Array<Action> }
- * Stronger constraints to prevent random actions:
- * - Requires "say" + "intent"
- * - "say" must paraphrase human request
- * - First action must align with intent
- * - If request not possible, ask a clarifying question and wander/return base
  */
 async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonomy" }) {
   const client = await getClient();
@@ -53,40 +49,42 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
     ``,
     `You must produce a realistic, helpful response and a plan.`,
     `If a human asked you to do something specific, DO NOT ignore it.`,
+    `If another bot DM'd you, reply helpfully (use SAY "@Name ...").`,
     ``,
     `Allowed actions (choose 1–3 steps total):`,
-    `- SAY: {"type":"SAY","text":"..." }  // short in-character chat`,
-    `- WANDER: {"type":"WANDER"}  // roam nearby aimlessly`,
+    `- SAY: {"type":"SAY","text":"..." }  // short chat; to reply to a DM, begin with "@Name "`,
+    `- WANDER: {"type":"WANDER"}  // roam nearby`,
     `- FOLLOW: {"type":"FOLLOW","player":"ExactPlayerName"}  // follow a player`,
     `- GOTO: {"type":"GOTO","x":0,"y":64,"z":0}  // walk to coordinates`,
-    `- RETURN_BASE: {"type":"RETURN_BASE"}  // go to saved base location`,
+    `- RETURN_BASE: {"type":"RETURN_BASE"}  // go to saved base`,
     `- GATHER_WOOD: {"type":"GATHER_WOOD","count":8}  // collect nearby logs`,
     `- MINE_BLOCKS: {"type":"MINE_BLOCKS","targets":["coal_ore","iron_ore","stone"],"count":10}  // mine nearby targets`,
     `- FARM_HARVEST_REPLANT: {"type":"FARM_HARVEST_REPLANT","crops":["wheat","carrots","potatoes"],"max":12}  // harvest+replant nearby crops`,
-    `- BUILD_STRUCTURE: {"type":"BUILD_STRUCTURE","kind":"FORT"|"WALL"|"TOWER"}  // build small starter defenses near you (no breaking blocks)`,
-    `- BUILD_MONUMENT: {"type":"BUILD_MONUMENT"}  // build simple decorative monument (no breaking blocks)`,
-    `- BUILD_MONUMENT_COMPLEX: {"type":"BUILD_MONUMENT_COMPLEX","kind":"OBELISK"|"ARCH"|"SPIRAL_TOWER"|"SHRINE"}  // build larger decorative monument (no breaking blocks)`,
-    `- CRAFT_TOOLS: {"type":"CRAFT_TOOLS"}  // craft basic tools if materials exist`,
-    `- SMELT_ORE: {"type":"SMELT_ORE"}  // smelt iron ore if furnace+fuel exist`,
+    `- BUILD_STRUCTURE: {"type":"BUILD_STRUCTURE","kind":"FORT"|"WALL"|"TOWER"}  // build small defenses (no breaking blocks)`,
+    `- BUILD_MONUMENT: {"type":"BUILD_MONUMENT"}  // simple decorative monument (no breaking blocks)`,
+    `- BUILD_MONUMENT_COMPLEX: {"type":"BUILD_MONUMENT_COMPLEX","kind":"OBELISK"|"ARCH"|"SPIRAL_TOWER"|"SHRINE"}  // larger decorative monument (no breaking blocks)`,
+    `- CRAFT_TOOLS: {"type":"CRAFT_TOOLS"}  // craft basic tools`,
+    `- SMELT_ORE: {"type":"SMELT_ORE"}  // smelt ore if possible`,
     `- FIGHT_MOBS: {"type":"FIGHT_MOBS","seconds":20}  // fight nearby hostiles briefly; stop if unsafe`,
     ``,
     `Output schema (MUST follow exactly):`,
-    `{"intent":"one short sentence about what the human wants", "say":"one short in-character message to the human", "plan":[ ...actions ]}`,
+    `{"intent":"one short sentence about what the latest request/message wants", "say":"one short in-character message", "plan":[ ...actions ]}`,
     ``,
-    `Say requirements (IMPORTANT):`,
+    `Say requirements:`,
     `- You MUST include "say" every time.`,
-    `- If this was a human request, "say" MUST paraphrase the request in 1 sentence, then briefly confirm what you’ll do.`,
-    `- If you cannot satisfy the request with the allowed actions, ask a clarifying question in "say" and set plan=[{"type":"WANDER"}] or [{"type":"RETURN_BASE"}].`,
+    `- If humanMessage exists, "say" MUST paraphrase it and confirm what you’ll do.`,
+    `- If bot DMs exist, "say" should reply (start with "@SenderName ...").`,
+    `- If you cannot satisfy a request with allowed actions, ask a clarifying question in "say" and set plan=[{"type":"WANDER"}] or [{"type":"RETURN_BASE"}].`,
     ``,
-    `Planning requirements (IMPORTANT):`,
-    `- The FIRST action in the plan MUST directly help accomplish the "intent".`,
-    `- Do not choose random actions unrelated to the human request.`,
+    `Planning requirements:`,
+    `- The FIRST action in plan MUST directly help accomplish the intent.`,
+    `- Do not choose random actions unrelated to the latest request/message.`,
     `- Choose only 1–3 steps total.`,
     ``,
     `Safety & behavior:`,
-    `- Never grief: do NOT break or destroy player-built structures or steal items.`,
+    `- Never grief: do NOT break/destroy player builds or steal items.`,
     `- Avoid harassment or threats.`,
-    `- If it's night and you’re low on food/health, prefer safety (RETURN_BASE / BUILD_STRUCTURE / brief safe tasks).`,
+    `- At night, prefer safer actions if low health/food.`,
   ];
 
   if (pos) {
@@ -96,11 +94,18 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   }
   if (invSummary) menu.push(`Inventory(top): ${invSummary}`);
 
-  // Team context (doesn't trigger immediate replans, just informs next plan)
+  // TEAM updates (shared context)
   const ev = recentEvents(10 * 60 * 1000, 12);
   if (ev.length) {
     menu.push("", "Recent TEAM updates (optional context):");
     for (const e of ev) menu.push(`- ${e.from}: ${e.text}`);
+  }
+
+  // ✅ Direct messages (per-bot inbox)
+  const dms = drainMessages(bot.username, 8);
+  if (dms.length) {
+    menu.push("", "Direct messages to you (reply helpfully):");
+    for (const m of dms) menu.push(`- From ${m.from}: ${m.text}`);
   }
 
   if (humanMessage) menu.push("", `Human said: "${humanMessage}"`);
@@ -150,7 +155,6 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
     throw err;
   }
 
-  // Parse JSON
   let obj;
   try {
     obj = JSON.parse(text);
@@ -165,21 +169,12 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
     return { say: "", plan: [{ type: "WANDER" }] };
   }
 
-  // Log intent separately (helps debug “random behavior”)
-  logPlan({
-    bot: bot.username,
-    trigger,
-    intent: obj?.intent || null
-  });
+  logPlan({ bot: bot.username, trigger, intent: obj?.intent || null });
 
   const say = obj?.say ? clampChat(obj.say) : "";
   const plan = Array.isArray(obj?.plan) ? obj.plan.slice(0, 3) : [{ type: "WANDER" }];
 
-  logPlan({
-    bot: bot.username,
-    trigger,
-    normalized: { say, plan }
-  });
+  logPlan({ bot: bot.username, trigger, normalized: { say, plan } });
 
   return { say, plan };
 }
