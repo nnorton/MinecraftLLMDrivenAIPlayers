@@ -10,6 +10,7 @@ const toolPlugin = require("mineflayer-tool").plugin;
 const { planActions } = require("./planner");
 const { postEvent } = require("./team_bus");
 const { pushMessage } = require("./inbox");
+const { pickNextTask } = require("./task_picker");
 
 const { goto, follow, wander, tickMovement } = require("./actions/movement");
 const { getBase, setBase } = require("./actions/memory");
@@ -24,6 +25,11 @@ const TASK_TICK_MS = 1500;
 const COOLDOWN_ON_HUMAN_MS = 1500;
 const WANDER_RADIUS = 10;
 
+// ---- “Always busy” controls ----
+const WANDER_MAX_MS = parseInt(process.env.WANDER_MAX_MS || "45000", 10); // after this, pick real task
+const STEP_TIMEOUT_MS = parseInt(process.env.STEP_TIMEOUT_MS || "180000", 10); // 3 min per step
+const STUCK_NO_MOVE_MS = parseInt(process.env.STUCK_NO_MOVE_MS || "20000", 10); // 20s no movement => reset
+
 // ---- Team influence controls ----
 const TEAM_PREFIX = "[TEAM]";
 const TEAM_EVENT_RATE_MS = 2500;
@@ -31,8 +37,8 @@ const TEAM_EVENT_RATE_MS = 2500;
 // ---- Bot-to-bot DM + social ping ----
 const ENABLE_SOCIAL_PING = (process.env.BOT_SOCIAL_PING || "1") === "1";
 const SOCIAL_PING_INTERVAL_MS = parseInt(process.env.BOT_SOCIAL_PING_INTERVAL_MS || "60000", 10);
-const SOCIAL_PING_PROB = parseFloat(process.env.BOT_SOCIAL_PING_PROB || "0.15"); // 0..1
-const BOT_DM_RATE_MS = parseInt(process.env.BOT_DM_RATE_MS || "15000", 10); // per bot: max 1 dm/15s
+const SOCIAL_PING_PROB = parseFloat(process.env.BOT_SOCIAL_PING_PROB || "0.15");
+const BOT_DM_RATE_MS = parseInt(process.env.BOT_DM_RATE_MS || "15000", 10);
 
 function clampChat(s) {
   return String(s || "").replace(/\s+/g, " ").trim().slice(0, 220);
@@ -42,10 +48,6 @@ function normalizeType(t) {
   return String(t || "").trim().toUpperCase();
 }
 
-/**
- * Creates a bot AND self-heals by spawning a replacement on disconnect.
- * Important: reconnect spawns a brand-new Mineflayer instance (required).
- */
 async function createAgent(opts) {
   const { host, port, persona, username, allBotNames } = opts;
 
@@ -57,7 +59,6 @@ async function createAgent(opts) {
 
   bot._planQueue = [];
   bot._current = null;
-
   bot._executing = false;
   bot._planning = false;
 
@@ -66,15 +67,19 @@ async function createAgent(opts) {
   bot._lastTeamEventAt = 0;
   bot._lastDmAt = 0;
 
-  // Chat throttle (avoid spam kicks)
+  // Watchdog state
+  bot._lastPos = null;
+  bot._lastMoveAt = Date.now();
+  bot._wanderStartedAt = 0;
+  bot._stepStartedAt = 0;
+
+  // Chat throttle
   bot._lastChatAt = 0;
   function safeChat(msg) {
     const t = Date.now();
     if (t - bot._lastChatAt < 1100) return;
     bot._lastChatAt = t;
-    try {
-      bot.chat(clampChat(msg));
-    } catch {}
+    try { bot.chat(clampChat(msg)); } catch {}
   }
 
   // --------------------------
@@ -86,9 +91,7 @@ async function createAgent(opts) {
 
   function cleanupTimers() {
     while (intervalIds.length) {
-      try {
-        clearInterval(intervalIds.pop());
-      } catch {}
+      try { clearInterval(intervalIds.pop()); } catch {}
     }
   }
 
@@ -99,25 +102,81 @@ async function createAgent(opts) {
     cleanupTimers();
 
     reconnectAttempts += 1;
-    const delay = Math.min(5000 * reconnectAttempts, 60000); // 5s, 10s, 15s... cap 60s
+    const delay = Math.min(5000 * reconnectAttempts, 60000);
 
     console.log(`[${username}] reconnecting in ${Math.round(delay / 1000)}s (reason=${reason})`);
 
     setTimeout(() => {
       try {
-        // spawn a fresh bot instance
         createAgent(opts);
       } catch (e) {
         console.error(`[${username}] reconnect spawn failed:`, e?.message || e);
-        // Try again later
         reconnectScheduled = false;
         scheduleReconnect("spawn_failed");
       }
     }, delay);
   }
 
+  function ensureWork(reason = "ensureWork") {
+    if (!bot.entity) return;
+    if (bot._planning) return;
+    if (bot._executing) return;
+
+    // If no plan, immediately pick a concrete task
+    if (!bot._planQueue || bot._planQueue.length === 0) {
+      bot._planQueue = [pickNextTask(bot)];
+      bot._current = null;
+      bot._wanderStartedAt = 0;
+      bot._stepStartedAt = 0;
+      return;
+    }
+
+    // If wandering too long, replace wander with a real task
+    const head = bot._planQueue[0];
+    if (normalizeType(head.type) === "WANDER") {
+      if (!bot._wanderStartedAt) bot._wanderStartedAt = Date.now();
+      if (Date.now() - bot._wanderStartedAt > WANDER_MAX_MS) {
+        bot._planQueue = [pickNextTask(bot)];
+        bot._current = null;
+        bot._wanderStartedAt = 0;
+        bot._stepStartedAt = 0;
+        safeChat("(switching tasks)");
+      }
+    } else {
+      bot._wanderStartedAt = 0;
+    }
+  }
+
+  function updateMovementWatchdog() {
+    if (!bot.entity) return;
+    const p = bot.entity.position;
+
+    if (!bot._lastPos) {
+      bot._lastPos = p.clone();
+      bot._lastMoveAt = Date.now();
+      return;
+    }
+
+    const moved = p.distanceTo(bot._lastPos) > 0.25;
+    if (moved) {
+      bot._lastPos = p.clone();
+      bot._lastMoveAt = Date.now();
+      return;
+    }
+
+    // If stuck: clear goal, clear current step, pick a new task
+    if (Date.now() - bot._lastMoveAt > STUCK_NO_MOVE_MS) {
+      try { bot.pathfinder.setGoal(null); } catch {}
+      bot._current = null;
+      // If we were in a long step, drop it
+      if (bot._planQueue && bot._planQueue.length) bot._planQueue.shift();
+      bot._planQueue = [pickNextTask(bot)];
+      bot._lastMoveAt = Date.now();
+      safeChat("(unstuck)");
+    }
+  }
+
   bot.once("spawn", () => {
-    // Successful connection -> reset backoff
     reconnectAttempts = 0;
     reconnectScheduled = false;
 
@@ -129,15 +188,15 @@ async function createAgent(opts) {
       if (b) postEvent(bot.username, `${TEAM_PREFIX} Base set at ${b.x} ${b.y} ${b.z}`);
     }
 
-    safeChat(`(${bot.username}) online. @mention me.`);
+    safeChat(`(${bot.username}) online.`);
 
-    bot._planQueue = [{ type: "WANDER" }];
-    wander(bot, WANDER_RADIUS);
+    // Start doing real work immediately
+    bot._planQueue = [pickNextTask(bot)];
+    bot._wanderStartedAt = 0;
 
-    // Task loop
     intervalIds.push(setInterval(() => tick(bot), TASK_TICK_MS));
 
-    // Autonomy loop: LLM max once/5 min/bot
+    // Autonomy loop stays as-is (LLM cadence unchanged)
     intervalIds.push(setInterval(async () => {
       if (!bot.entity) return;
       if (bot._planning) return;
@@ -155,17 +214,18 @@ async function createAgent(opts) {
         if (say) safeChat(say);
 
         bot.pathfinder.setGoal(null);
-        bot._planQueue = Array.isArray(plan) && plan.length ? plan : [{ type: "WANDER" }];
+        bot._planQueue = Array.isArray(plan) && plan.length ? plan : [pickNextTask(bot)];
         bot._current = null;
         bot._lastAutonomyAt = Date.now();
+        bot._wanderStartedAt = 0;
       } catch (e) {
-        console.error(`[${bot.username}] autonomy planning error:`, (e && e.message) ? e.message : e);
+        console.error(`[${bot.username}] autonomy planning error:`, e?.message || e);
       } finally {
         bot._planning = false;
       }
     }, 15000));
 
-    // Social ping loop: bots initiate DMs without humans
+    // Social ping loop (optional)
     if (ENABLE_SOCIAL_PING) {
       intervalIds.push(setInterval(() => {
         try {
@@ -177,8 +237,6 @@ async function createAgent(opts) {
           if (!others.length) return;
 
           const target = others[Math.floor(Math.random() * others.length)];
-
-          // DM rate limit per bot
           const now = Date.now();
           if (now - bot._lastDmAt < BOT_DM_RATE_MS) return;
           bot._lastDmAt = now;
@@ -194,21 +252,19 @@ async function createAgent(opts) {
 
     const isBotSender = allBotNames && allBotNames.has(sender);
 
-    // Record TEAM broadcasts
     if (String(message).startsWith(TEAM_PREFIX)) {
       const t = Date.now();
       if (t - bot._lastTeamEventAt > TEAM_EVENT_RATE_MS) {
         bot._lastTeamEventAt = t;
         postEvent(sender, message);
       }
-      return; // never replan directly from TEAM messages
+      return;
     }
 
     const mention = `@${bot.username}`;
     const isMentionToMe = message.toLowerCase().startsWith(mention.toLowerCase());
 
-    // Bot-to-bot DM: if another bot @mentions me, put it in my inbox.
-    // Do NOT trigger immediate replanning (prevents loops).
+    // Bot-to-bot DM inbox
     if (isBotSender) {
       if (isMentionToMe) {
         const dmText = message.slice(mention.length).trim();
@@ -217,17 +273,15 @@ async function createAgent(opts) {
       return;
     }
 
-    // Human-triggered replanning
+    // Human mention -> immediate LLM plan
     if (!isMentionToMe) return;
-
     if (Date.now() - bot._lastHumanAt < COOLDOWN_ON_HUMAN_MS) return;
     bot._lastHumanAt = Date.now();
 
     const humanText = message.slice(mention.length).trim();
-
     if (bot._planning) return;
-    bot._planning = true;
 
+    bot._planning = true;
     try {
       const { say, plan } = await planActions({
         systemPrompt: persona.system,
@@ -237,26 +291,24 @@ async function createAgent(opts) {
       });
 
       safeChat(say || `I heard you: "${humanText}". What should I do first?`);
-
       bot.pathfinder.setGoal(null);
-      bot._planQueue = Array.isArray(plan) && plan.length ? plan : [{ type: "WANDER" }];
+      bot._planQueue = Array.isArray(plan) && plan.length ? plan : [pickNextTask(bot)];
       bot._current = null;
+      bot._wanderStartedAt = 0;
     } catch (e) {
-      console.error(`[${bot.username}] chat planning error:`, (e && e.message) ? e.message : e);
+      console.error(`[${bot.username}] chat planning error:`, e?.message || e);
       safeChat("I had trouble thinking—can you repeat that?");
     } finally {
       bot._planning = false;
     }
   });
 
-  // Kicked can happen before end; scheduleReconnect is idempotent
   bot.on("kicked", (reason) => {
     console.warn(`[${username}] kicked:`, reason);
     scheduleReconnect("kicked");
   });
 
   bot.on("error", (err) => {
-    // EPIPE etc can appear after disconnect; reconnect handled by 'end'
     console.error(`[${username}] bot error:`, err?.message || err);
   });
 
@@ -268,18 +320,34 @@ async function createAgent(opts) {
   async function tick(bot) {
     if (!bot.entity) return;
 
+    // Always-busy enforcement + stuck detection
+    ensureWork("tick");
+    updateMovementWatchdog();
+
+    // If movement subsystem is handling something, let it run
     if (tickMovement(bot)) return;
     if (bot._executing) return;
     if (!bot._planQueue || bot._planQueue.length === 0) return;
+
+    // Step timeout watchdog
+    if (bot._stepStartedAt && Date.now() - bot._stepStartedAt > STEP_TIMEOUT_MS) {
+      try { bot.pathfinder.setGoal(null); } catch {}
+      bot._current = null;
+      if (bot._planQueue.length) bot._planQueue.shift();
+      bot._planQueue = [pickNextTask(bot)];
+      bot._stepStartedAt = 0;
+      safeChat("(timed out, switching tasks)");
+      return;
+    }
 
     const step = bot._planQueue[0];
     const type = normalizeType(step.type);
 
     bot._executing = true;
+    if (!bot._stepStartedAt) bot._stepStartedAt = Date.now();
 
     try {
       if (type === "SAY") {
-        // DM rate limit to avoid chatter storms
         const now = Date.now();
         const txt = String(step.text || "");
         const isDm = txt.trim().startsWith("@");
@@ -289,15 +357,20 @@ async function createAgent(opts) {
         }
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "WANDER") {
         wander(bot, WANDER_RADIUS);
+        // don't shift; ensureWork will replace wander after WANDER_MAX_MS
+        bot._stepStartedAt = 0;
 
       } else if (type === "FOLLOW") {
         follow(bot, step.player);
+        bot._stepStartedAt = 0;
 
       } else if (type === "GOTO") {
         goto(bot, step.x, step.y, step.z);
+        bot._stepStartedAt = 0;
 
       } else if (type === "RETURN_BASE") {
         const b = getBase(bot);
@@ -307,77 +380,76 @@ async function createAgent(opts) {
         } else {
           goto(bot, b.x, b.y, b.z);
         }
+        bot._stepStartedAt = 0;
 
       } else if (type === "GATHER_WOOD") {
         await gather.gatherWood(bot, step.count ?? 8);
-        const p = bot.entity.position.floored();
-        postEvent(bot.username, `${TEAM_PREFIX} Gathered wood near ${p.x} ${p.y} ${p.z}`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "MINE_BLOCKS") {
         await gather.mineTargets(bot, step.targets ?? ["coal_ore", "iron_ore", "stone"], step.count ?? 10);
-        const p = bot.entity.position.floored();
-        postEvent(bot.username, `${TEAM_PREFIX} Mining done near ${p.x} ${p.y} ${p.z}`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "FARM_HARVEST_REPLANT") {
         await gather.farmHarvestReplant(bot, step.crops ?? ["wheat", "carrots", "potatoes"], step.max ?? 12);
-        const p = bot.entity.position.floored();
-        postEvent(bot.username, `${TEAM_PREFIX} Farmed near ${p.x} ${p.y} ${p.z}`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "BUILD_STRUCTURE") {
         await buildFort(bot);
-        const p = bot.entity.position.floored();
-        postEvent(bot.username, `${TEAM_PREFIX} Built structure near ${p.x} ${p.y} ${p.z}`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "BUILD_MONUMENT") {
         await buildMonument(bot);
-        const p = bot.entity.position.floored();
-        postEvent(bot.username, `${TEAM_PREFIX} Built monument near ${p.x} ${p.y} ${p.z}`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "BUILD_MONUMENT_COMPLEX") {
         await buildMonumentComplex(bot, step.kind || "OBELISK");
-        const p = bot.entity.position.floored();
-        postEvent(bot.username, `${TEAM_PREFIX} Built complex monument (${step.kind || "OBELISK"}) near ${p.x} ${p.y} ${p.z}`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "CRAFT_TOOLS") {
         await craftTools(bot);
-        postEvent(bot.username, `${TEAM_PREFIX} Crafted tools.`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "SMELT_ORE") {
         await smeltOre(bot);
-        postEvent(bot.username, `${TEAM_PREFIX} Started smelting.`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else if (type === "FIGHT_MOBS") {
         await fightMobs(bot, step.seconds ?? 20);
-        postEvent(bot.username, `${TEAM_PREFIX} Cleared nearby hostiles.`);
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
 
       } else {
         bot._planQueue.shift();
         bot._current = null;
+        bot._stepStartedAt = 0;
       }
     } catch (e) {
-      console.error(`[${bot.username}] step failed`, (e && e.message) ? e.message : e);
+      console.error(`[${bot.username}] step failed`, e?.message || e);
       bot._planQueue.shift();
       bot._current = null;
+      bot._stepStartedAt = 0;
     } finally {
       bot._executing = false;
+      // Always ensure there is a next task queued
+      ensureWork("finally");
     }
   }
 
