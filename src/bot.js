@@ -42,7 +42,13 @@ function normalizeType(t) {
   return String(t || "").trim().toUpperCase();
 }
 
-async function createAgent({ host, port, persona, username, allBotNames }) {
+/**
+ * Creates a bot AND self-heals by spawning a replacement on disconnect.
+ * Important: reconnect spawns a brand-new Mineflayer instance (required).
+ */
+async function createAgent(opts) {
+  const { host, port, persona, username, allBotNames } = opts;
+
   const bot = mineflayer.createBot({ host, port, username });
 
   bot.loadPlugin(pathfinder);
@@ -66,10 +72,55 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
     const t = Date.now();
     if (t - bot._lastChatAt < 1100) return;
     bot._lastChatAt = t;
-    try { bot.chat(clampChat(msg)); } catch {}
+    try {
+      bot.chat(clampChat(msg));
+    } catch {}
+  }
+
+  // --------------------------
+  // Reconnect / backoff state
+  // --------------------------
+  let reconnectAttempts = 0;
+  let reconnectScheduled = false;
+  const intervalIds = [];
+
+  function cleanupTimers() {
+    while (intervalIds.length) {
+      try {
+        clearInterval(intervalIds.pop());
+      } catch {}
+    }
+  }
+
+  function scheduleReconnect(reason) {
+    if (reconnectScheduled) return;
+    reconnectScheduled = true;
+
+    cleanupTimers();
+
+    reconnectAttempts += 1;
+    const delay = Math.min(5000 * reconnectAttempts, 60000); // 5s, 10s, 15s... cap 60s
+
+    console.log(`[${username}] reconnecting in ${Math.round(delay / 1000)}s (reason=${reason})`);
+
+    setTimeout(() => {
+      try {
+        // spawn a fresh bot instance
+        createAgent(opts);
+      } catch (e) {
+        console.error(`[${username}] reconnect spawn failed:`, e?.message || e);
+        // Try again later
+        reconnectScheduled = false;
+        scheduleReconnect("spawn_failed");
+      }
+    }, delay);
   }
 
   bot.once("spawn", () => {
+    // Successful connection -> reset backoff
+    reconnectAttempts = 0;
+    reconnectScheduled = false;
+
     const mcData = mcDataLoader(bot.version);
     bot.pathfinder.setMovements(new Movements(bot, mcData));
 
@@ -83,10 +134,11 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
     bot._planQueue = [{ type: "WANDER" }];
     wander(bot, WANDER_RADIUS);
 
-    setInterval(() => tick(bot), TASK_TICK_MS);
+    // Task loop
+    intervalIds.push(setInterval(() => tick(bot), TASK_TICK_MS));
 
     // Autonomy loop: LLM max once/5 min/bot
-    setInterval(async () => {
+    intervalIds.push(setInterval(async () => {
       if (!bot.entity) return;
       if (bot._planning) return;
       if (Date.now() - bot._lastAutonomyAt < AUTONOMY_INTERVAL_MS) return;
@@ -111,11 +163,11 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
       } finally {
         bot._planning = false;
       }
-    }, 15000);
+    }, 15000));
 
-    // ✅ Social ping loop: bots initiate DMs without humans
+    // Social ping loop: bots initiate DMs without humans
     if (ENABLE_SOCIAL_PING) {
-      setInterval(() => {
+      intervalIds.push(setInterval(() => {
         try {
           if (!bot.entity) return;
           if (bot._planning || bot._executing) return;
@@ -133,7 +185,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
 
           safeChat(`@${target} status check — what are you working on?`);
         } catch {}
-      }, SOCIAL_PING_INTERVAL_MS);
+      }, SOCIAL_PING_INTERVAL_MS));
     }
   });
 
@@ -155,14 +207,12 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
     const mention = `@${bot.username}`;
     const isMentionToMe = message.toLowerCase().startsWith(mention.toLowerCase());
 
-    // ✅ Bot-to-bot DMs: if another bot @mentions me, put it in my inbox.
+    // Bot-to-bot DM: if another bot @mentions me, put it in my inbox.
     // Do NOT trigger immediate replanning (prevents loops).
     if (isBotSender) {
       if (isMentionToMe) {
         const dmText = message.slice(mention.length).trim();
         pushMessage(bot.username, sender, dmText);
-        // Optional acknowledgement (disabled by default; can cause chatter):
-        // safeChat(`@${sender} got it — I'll respond soon.`);
       }
       return;
     }
@@ -199,8 +249,21 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
     }
   });
 
-  bot.on("error", (e) => console.error(`[${bot.username}] bot error`, e));
-  bot.on("end", () => console.log(`[${bot.username}] disconnected`));
+  // Kicked can happen before end; scheduleReconnect is idempotent
+  bot.on("kicked", (reason) => {
+    console.warn(`[${username}] kicked:`, reason);
+    scheduleReconnect("kicked");
+  });
+
+  bot.on("error", (err) => {
+    // EPIPE etc can appear after disconnect; reconnect handled by 'end'
+    console.error(`[${username}] bot error:`, err?.message || err);
+  });
+
+  bot.on("end", () => {
+    console.warn(`[${username}] disconnected`);
+    scheduleReconnect("end");
+  });
 
   async function tick(bot) {
     if (!bot.entity) return;
@@ -216,7 +279,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
 
     try {
       if (type === "SAY") {
-        // DM rate limit to avoid bot chatter storms
+        // DM rate limit to avoid chatter storms
         const now = Date.now();
         const txt = String(step.text || "");
         const isDm = txt.trim().startsWith("@");
