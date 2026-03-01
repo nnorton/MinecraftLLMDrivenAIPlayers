@@ -10,6 +10,11 @@
 const { goals } = require("mineflayer-pathfinder");
 const GoalNear = goals.GoalNear;
 
+// IMPORTANT FIX:
+// Mineflayer expects Vec3 instances for positions passed to bot.blockAt() / placeBlock faces.
+// The vec3 package exports a factory function that returns a Vec3 with methods like .floored().
+const vec3 = require("vec3");
+
 function clampInt(n, lo, hi, fallback) {
   const x = Number.isFinite(n) ? Math.floor(n) : fallback;
   return Math.max(lo, Math.min(hi, x));
@@ -31,9 +36,11 @@ function chooseMaterialFromInventory(bot, preferredList) {
   const candidates = Object.entries(counts)
     .filter(([name, count]) => count > 0 && !name.includes("pickaxe") && !name.includes("axe") && !name.includes("shovel"))
     .map(([name]) => name);
-
   // Try common planks/cobble-ish
-  const common = candidates.find((n) => n.includes("planks")) || candidates.find((n) => n.includes("stone")) || candidates[0];
+  const common =
+    candidates.find((n) => n.includes("planks")) ||
+    candidates.find((n) => n.includes("stone")) ||
+    candidates[0];
   return common || null;
 }
 
@@ -52,12 +59,11 @@ async function equipBlock(bot, itemName) {
 }
 
 function getBaseOrCurrent(bot) {
-  // Try your memory base module if available via bot._memory
-  // but keep build.js standalone.
   // If bot has a known base on bot._base use it; else use current position.
   const p = bot.entity?.position;
   if (!p) return null;
-  return { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
+  // Return a REAL Vec3 (not a plain object)
+  return vec3(Math.round(p.x), Math.round(p.y), Math.round(p.z));
 }
 
 function isSolid(block) {
@@ -71,12 +77,13 @@ function isAir(block) {
   return block.name === "air" || block.boundingBox === "empty";
 }
 
-function vec3(x, y, z) {
-  return { x, y, z };
+// Return real Vec3 everywhere
+function v(x, y, z) {
+  return vec3(x, y, z);
 }
 
 function add(a, b) {
-  return vec3(a.x + b.x, a.y + b.y, a.z + b.z);
+  return v(a.x + b.x, a.y + b.y, a.z + b.z);
 }
 
 function keyOf(p) {
@@ -91,7 +98,6 @@ function keyOf(p) {
 function findBuildOrigin(bot, size, maxRadius = 18) {
   const center = getBaseOrCurrent(bot);
   if (!center) throw new Error("Cannot determine build origin (no position)");
-
   const half = Math.floor(size / 2);
   const yStart = center.y;
 
@@ -105,8 +111,8 @@ function findBuildOrigin(bot, size, maxRadius = 18) {
         // Use ground y = highest solid under starting y within small range
         let gy = yStart;
         for (let dy = 0; dy <= 6; dy++) {
-          const below = bot.blockAt(vec3(ox, yStart - dy - 1, oz));
-          const feet = bot.blockAt(vec3(ox, yStart - dy, oz));
+          const below = bot.blockAt(v(ox, yStart - dy - 1, oz));
+          const feet = bot.blockAt(v(ox, yStart - dy, oz));
           if (isSolid(below) && isAir(feet)) {
             gy = yStart - dy;
             break;
@@ -117,19 +123,19 @@ function findBuildOrigin(bot, size, maxRadius = 18) {
         let ok = true;
         for (let fx = -half; fx <= half && ok; fx++) {
           for (let fz = -half; fz <= half && ok; fz++) {
-            const ground = bot.blockAt(vec3(ox + fx, gy - 1, oz + fz));
-            const a1 = bot.blockAt(vec3(ox + fx, gy, oz + fz));
-            const a2 = bot.blockAt(vec3(ox + fx, gy + 1, oz + fz));
+            const ground = bot.blockAt(v(ox + fx, gy - 1, oz + fz));
+            const a1 = bot.blockAt(v(ox + fx, gy, oz + fz));
+            const a2 = bot.blockAt(v(ox + fx, gy + 1, oz + fz));
             if (!isSolid(ground) || !isAir(a1) || !isAir(a2)) ok = false;
           }
         }
-        if (ok) return vec3(ox, gy, oz);
+        if (ok) return v(ox, gy, oz);
       }
     }
   }
 
   // Fallback: build where the bot is (may be messy)
-  return vec3(center.x, center.y, center.z);
+  return v(center.x, center.y, center.z);
 }
 
 /**
@@ -160,24 +166,24 @@ async function moveNear(bot, pos, range = 3) {
  * Mineflayer placeBlock requires clicking a neighbor block face.
  */
 function findPlaceReference(bot, target) {
-  const below = bot.blockAt(vec3(target.x, target.y - 1, target.z));
-  if (isSolid(below)) return { ref: below, face: vec3(0, 1, 0) };
+  const below = bot.blockAt(v(target.x, target.y - 1, target.z));
+  if (isSolid(below)) return { ref: below, face: v(0, 1, 0) };
 
   // Try 4 sides
   const neighbors = [
-    { dx: 1, dz: 0, face: vec3(-1, 0, 0) },
-    { dx: -1, dz: 0, face: vec3(1, 0, 0) },
-    { dx: 0, dz: 1, face: vec3(0, 0, -1) },
-    { dx: 0, dz: -1, face: vec3(0, 0, 1) },
+    { dx: 1, dz: 0, face: v(-1, 0, 0) },
+    { dx: -1, dz: 0, face: v(1, 0, 0) },
+    { dx: 0, dz: 1, face: v(0, 0, -1) },
+    { dx: 0, dz: -1, face: v(0, 0, 1) },
   ];
   for (const n of neighbors) {
-    const b = bot.blockAt(vec3(target.x + n.dx, target.y, target.z + n.dz));
+    const b = bot.blockAt(v(target.x + n.dx, target.y, target.z + n.dz));
     if (isSolid(b)) return { ref: b, face: n.face };
   }
 
   // Try above (rarely useful)
-  const above = bot.blockAt(vec3(target.x, target.y + 1, target.z));
-  if (isSolid(above)) return { ref: above, face: vec3(0, -1, 0) };
+  const above = bot.blockAt(v(target.x, target.y + 1, target.z));
+  if (isSolid(above)) return { ref: above, face: v(0, -1, 0) };
 
   return null;
 }
@@ -218,14 +224,13 @@ async function placeOne(bot, target, material) {
 // - optional floor (1 layer) for recognizability
 function blueprintFort(size, wallH, towerH) {
   const half = Math.floor(size / 2);
-
   const placements = [];
   const floorY = 0; // origin y is floor level where bot stands (air). Ground is y-1.
 
   // Floor (optional but makes it readable)
   for (let x = -half; x <= half; x++) {
     for (let z = -half; z <= half; z++) {
-      placements.push({ pos: vec3(x, floorY, z), tag: "floor" });
+      placements.push({ pos: v(x, floorY, z), tag: "floor" });
     }
   }
 
@@ -233,12 +238,12 @@ function blueprintFort(size, wallH, towerH) {
   for (let y = 1; y <= wallH; y++) {
     for (let x = -half; x <= half; x++) {
       // north/south
-      placements.push({ pos: vec3(x, y, -half), tag: "wall" });
-      placements.push({ pos: vec3(x, y, half), tag: "wall" });
+      placements.push({ pos: v(x, y, -half), tag: "wall" });
+      placements.push({ pos: v(x, y, half), tag: "wall" });
     }
     for (let z = -half; z <= half; z++) {
-      placements.push({ pos: vec3(-half, y, z), tag: "wall" });
-      placements.push({ pos: vec3(half, y, z), tag: "wall" });
+      placements.push({ pos: v(-half, y, z), tag: "wall" });
+      placements.push({ pos: v(half, y, z), tag: "wall" });
     }
   }
 
@@ -248,44 +253,37 @@ function blueprintFort(size, wallH, towerH) {
   for (let y = 1; y <= 2; y++) {
     // remove placements at these coords by filtering later
     // We'll mark as "gate_void" and filter out.
-    placements.push({ pos: vec3(gateX1, y, half), tag: "gate_void" });
-    placements.push({ pos: vec3(gateX2, y, half), tag: "gate_void" });
+    placements.push({ pos: v(gateX1, y, half), tag: "gate_void" });
+    placements.push({ pos: v(gateX2, y, half), tag: "gate_void" });
   }
 
   // Towers (corners)
-  const corners = [
-    vec3(-half, 1, -half),
-    vec3(half, 1, -half),
-    vec3(-half, 1, half),
-    vec3(half, 1, half),
-  ];
+  const corners = [v(-half, 1, -half), v(half, 1, -half), v(-half, 1, half), v(half, 1, half)];
   for (const c of corners) {
     for (let y = 1; y <= towerH; y++) {
       // 2x2 tower footprint anchored at corner inward
       const sx = c.x === -half ? -half : half - 1;
       const sz = c.z === -half ? -half : half - 1;
-      placements.push({ pos: vec3(sx, y, sz), tag: "tower" });
-      placements.push({ pos: vec3(sx + 1, y, sz), tag: "tower" });
-      placements.push({ pos: vec3(sx, y, sz + 1), tag: "tower" });
-      placements.push({ pos: vec3(sx + 1, y, sz + 1), tag: "tower" });
+      placements.push({ pos: v(sx, y, sz), tag: "tower" });
+      placements.push({ pos: v(sx + 1, y, sz), tag: "tower" });
+      placements.push({ pos: v(sx, y, sz + 1), tag: "tower" });
+      placements.push({ pos: v(sx + 1, y, sz + 1), tag: "tower" });
     }
   }
 
   // Battlements (simple crenellation)
   const topY = wallH + 1;
   for (let x = -half; x <= half; x += 2) {
-    placements.push({ pos: vec3(x, topY, -half), tag: "battlement" });
-    placements.push({ pos: vec3(x, topY, half), tag: "battlement" });
+    placements.push({ pos: v(x, topY, -half), tag: "battlement" });
+    placements.push({ pos: v(x, topY, half), tag: "battlement" });
   }
   for (let z = -half; z <= half; z += 2) {
-    placements.push({ pos: vec3(-half, topY, z), tag: "battlement" });
-    placements.push({ pos: vec3(half, topY, z), tag: "battlement" });
+    placements.push({ pos: v(-half, topY, z), tag: "battlement" });
+    placements.push({ pos: v(half, topY, z), tag: "battlement" });
   }
 
   // Filter out gate voids from wall placements
-  const voidKeys = new Set(
-    placements.filter((p) => p.tag === "gate_void").map((p) => keyOf(p.pos))
-  );
+  const voidKeys = new Set(placements.filter((p) => p.tag === "gate_void").map((p) => keyOf(p.pos)));
   const filtered = placements.filter((p) => p.tag !== "gate_void" && !voidKeys.has(keyOf(p.pos)));
   return filtered;
 }
@@ -293,25 +291,28 @@ function blueprintFort(size, wallH, towerH) {
 // Obelisk: 3x3 base pedestal + tall 1x1 pillar with cap
 function blueprintObelisk(height) {
   const placements = [];
+
   // Pedestal 3x3 x 2 high
   for (let y = 0; y <= 1; y++) {
     for (let x = -1; x <= 1; x++) {
       for (let z = -1; z <= 1; z++) {
-        placements.push({ pos: vec3(x, y, z), tag: "pedestal" });
+        placements.push({ pos: v(x, y, z), tag: "pedestal" });
       }
     }
   }
+
   // Pillar
   for (let y = 2; y < height + 2; y++) {
-    placements.push({ pos: vec3(0, y, 0), tag: "pillar" });
+    placements.push({ pos: v(0, y, 0), tag: "pillar" });
   }
+
   // Cap (cross)
   const capY = height + 2;
-  placements.push({ pos: vec3(0, capY, 0), tag: "cap" });
-  placements.push({ pos: vec3(1, capY, 0), tag: "cap" });
-  placements.push({ pos: vec3(-1, capY, 0), tag: "cap" });
-  placements.push({ pos: vec3(0, capY, 1), tag: "cap" });
-  placements.push({ pos: vec3(0, capY, -1), tag: "cap" });
+  placements.push({ pos: v(0, capY, 0), tag: "cap" });
+  placements.push({ pos: v(1, capY, 0), tag: "cap" });
+  placements.push({ pos: v(-1, capY, 0), tag: "cap" });
+  placements.push({ pos: v(0, capY, 1), tag: "cap" });
+  placements.push({ pos: v(0, capY, -1), tag: "cap" });
 
   return placements;
 }
@@ -377,10 +378,7 @@ async function runBlueprint(bot, origin, placements, material, opts = {}) {
   return { ok, skipped, failed, present, total: totalNeeded, completion };
 }
 
-/**
- * Public build APIs used by bot.js
- */
-
+/** Public build APIs used by bot.js */
 async function buildFort(bot, params = {}) {
   // Enforce recognizable minimums
   const size = clampInt(params.size, 9, 13, 9);
@@ -392,7 +390,6 @@ async function buildFort(bot, params = {}) {
   const material =
     requested ||
     chooseMaterialFromInventory(bot, ["cobblestone", "stone_bricks", "deepslate", "cobbled_deepslate", "stone", "oak_planks"]);
-
   if (!material) throw new Error("No placeable material found for fort");
 
   const origin = findBuildOrigin(bot, size);
@@ -400,7 +397,6 @@ async function buildFort(bot, params = {}) {
 
   // Rough min blocks: ensure it can't "finish" tiny
   const minRequiredBlocks = Math.max(120, Math.floor(blueprint.length * 0.6));
-
   return runBlueprint(bot, origin, blueprint, material, { minComplete: 0.8, minRequiredBlocks });
 }
 
@@ -411,14 +407,11 @@ async function buildMonument(bot, params = {}) {
   // Prefer clean blocks
   const requested = params.material ? String(params.material) : null;
   const material =
-    requested ||
-    chooseMaterialFromInventory(bot, ["stone_bricks", "smooth_stone", "quartz_block", "cobblestone", "stone", "oak_planks"]);
-
+    requested || chooseMaterialFromInventory(bot, ["stone_bricks", "smooth_stone", "quartz_block", "cobblestone", "stone", "oak_planks"]);
   if (!material) throw new Error("No placeable material found for monument");
 
   const origin = findBuildOrigin(bot, 7); // small footprint scan
   const blueprint = blueprintObelisk(height);
-
   const minRequiredBlocks = Math.max(30, Math.floor(blueprint.length * 0.8));
   return runBlueprint(bot, origin, blueprint, material, { minComplete: 0.85, minRequiredBlocks });
 }
@@ -433,8 +426,4 @@ async function buildMonumentComplex(bot, kind = "OBELISK", params = {}) {
   return buildMonument(bot, { ...params, height: clampInt(params.height, 11, 25, 13) });
 }
 
-module.exports = {
-  buildFort,
-  buildMonument,
-  buildMonumentComplex,
-};
+module.exports = { buildFort, buildMonument, buildMonumentComplex };
