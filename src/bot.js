@@ -28,12 +28,12 @@ const WANDER_RADIUS = 30;
 // ---- “Always busy” controls ----
 const WANDER_MAX_MS = parseInt(process.env.WANDER_MAX_MS || "45000", 10);
 const STEP_TIMEOUT_MS = parseInt(process.env.STEP_TIMEOUT_MS || "180000", 10);
-const STUCK_NO_MOVE_MS = parseInt(process.env.STUCK_NO_MOVE_MS || "20000", 10);
+const STUCK_NO_MOVE_MS = parseInt(process.env.STUCK_NO_MOVE_MS || "35000", 10); // a bit more tolerant by default
 
-// ✅ New: anti-spam + grace periods
-const UNSTUCK_COOLDOWN_MS = parseInt(process.env.UNSTUCK_COOLDOWN_MS || "60000", 10); // 60s
-const GOAL_GRACE_MS = parseInt(process.env.GOAL_GRACE_MS || "6000", 10); // 6s after goal change
-const UNSTUCK_STAGE1_MS = parseInt(process.env.UNSTUCK_STAGE1_MS || "8000", 10); // stage1 attempt window
+// ---- Extra unstuck tuning ----
+const UNSTUCK_COOLDOWN_MS = parseInt(process.env.UNSTUCK_COOLDOWN_MS || "90000", 10);
+const GOAL_GRACE_MS = parseInt(process.env.GOAL_GRACE_MS || "8000", 10);
+const UNSTUCK_STAGE1_MS = parseInt(process.env.UNSTUCK_STAGE1_MS || "9000", 10);
 
 // ---- Team influence controls ----
 const TEAM_PREFIX = "[TEAM]";
@@ -87,7 +87,6 @@ async function createAgent(opts) {
   bot._wanderStartedAt = 0;
   bot._stepStartedAt = 0;
 
-  // ✅ New: unstuck control state
   bot._lastUnstuckAt = 0;
   bot._lastGoalChangeAt = 0;
   bot._unstuckStage1At = 0;
@@ -103,11 +102,10 @@ async function createAgent(opts) {
     } catch {}
   }
 
-  // Track goal changes for grace period
+  // Track goal changes for grace period (best-effort)
   try {
     bot.pathfinder.on("goal_updated", () => {
       bot._lastGoalChangeAt = Date.now();
-      // reset movement baseline on new goal to avoid immediate false unstuck
       bot._lastPos = bot.entity?.position ? bot.entity.position.clone() : bot._lastPos;
       bot._lastMoveAt = Date.now();
     });
@@ -151,7 +149,6 @@ async function createAgent(opts) {
     if (bot._planning) return;
     if (bot._executing) return;
 
-    // If team intel arrived recently, do a cheap replan (no LLM)
     if (bot._teamDirty) {
       const head = bot._planQueue?.[0];
       const headType = head ? normalizeType(head.type) : "";
@@ -174,7 +171,6 @@ async function createAgent(opts) {
       return;
     }
 
-    // If wandering too long, replace wander with a real task
     const head = bot._planQueue[0];
     if (normalizeType(head.type) === "WANDER") {
       if (!bot._wanderStartedAt) bot._wanderStartedAt = Date.now();
@@ -197,7 +193,6 @@ async function createAgent(opts) {
   }
 
   async function doUnstuckStage1() {
-    // Small “wiggle” attempt that often solves fence/corner jitter without nuking the plan
     try {
       bot.setControlState("jump", true);
       bot.setControlState("left", true);
@@ -214,16 +209,10 @@ async function createAgent(opts) {
 
   function updateMovementWatchdog() {
     if (!bot.entity) return;
-
-    // Only apply to movement actions
     if (!isMovementAction()) return;
 
     const now = Date.now();
-
-    // Cooldown so it can't spam
     if (now - bot._lastUnstuckAt < UNSTUCK_COOLDOWN_MS) return;
-
-    // Grace period after goal changes
     if (now - bot._lastGoalChangeAt < GOAL_GRACE_MS) return;
 
     const p = bot.entity.position;
@@ -242,18 +231,14 @@ async function createAgent(opts) {
       return;
     }
 
-    // If we haven't moved for a while…
     if (now - bot._lastMoveAt > STUCK_NO_MOVE_MS) {
-      // Stage 1: try a quick wiggle first (once), then wait a bit
       if (!bot._unstuckStage1At) {
         bot._unstuckStage1At = now;
         doUnstuckStage1();
-        // Give it some time to resolve without spamming chat
         bot._lastMoveAt = now;
         return;
       }
 
-      // If stage1 didn't help after a window, Stage 2: cancel goal + new task
       if (now - bot._unstuckStage1At > UNSTUCK_STAGE1_MS) {
         try {
           bot.pathfinder.setGoal(null);
@@ -314,7 +299,6 @@ async function createAgent(opts) {
           bot._wanderStartedAt = 0;
           bot._teamDirty = false;
 
-          // goal grace
           bot._lastGoalChangeAt = Date.now();
         } catch (e) {
           console.error(`[${bot.username}] autonomy planning error:`, e?.message || e);
@@ -420,8 +404,6 @@ async function createAgent(opts) {
     if (!bot.entity) return;
 
     ensureWork();
-
-    // Movement watchdog (now with grace + cooldown + staged)
     updateMovementWatchdog();
 
     if (tickMovement(bot)) return;
@@ -502,17 +484,18 @@ async function createAgent(opts) {
         bot._current = null;
         bot._stepStartedAt = 0;
       } else if (type === "BUILD_STRUCTURE") {
-        await buildFort(bot);
+        // ✅ NEW: Pass parameters through so builder can size/choose materials.
+        await buildFort(bot, step);
         bot._planQueue.shift();
         bot._current = null;
         bot._stepStartedAt = 0;
       } else if (type === "BUILD_MONUMENT") {
-        await buildMonument(bot);
+        await buildMonument(bot, step);
         bot._planQueue.shift();
         bot._current = null;
         bot._stepStartedAt = 0;
       } else if (type === "BUILD_MONUMENT_COMPLEX") {
-        await buildMonumentComplex(bot, step.kind || "OBELISK");
+        await buildMonumentComplex(bot, step.kind || "OBELISK", step);
         bot._planQueue.shift();
         bot._current = null;
         bot._stepStartedAt = 0;
