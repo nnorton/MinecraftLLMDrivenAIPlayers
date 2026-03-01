@@ -52,7 +52,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
   bot._lastHumanAt = 0;
   bot._lastTeamEventAt = 0;
 
-  // Basic chat throttle (helps avoid spam rules)
+  // Chat throttle (avoid spam kicks)
   bot._lastChatAt = 0;
   function safeChat(msg) {
     const t = Date.now();
@@ -92,6 +92,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
           trigger: "autonomy"
         });
 
+        // If model didn't provide say, don’t spam chat; just execute plan
         if (say) safeChat(say);
 
         bot.pathfinder.setGoal(null);
@@ -121,11 +122,10 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
         bot._lastTeamEventAt = t;
         postEvent(sender, message);
       }
-      // Never replan directly from TEAM messages (prevents loops)
-      return;
+      return; // never replan directly from TEAM messages
     }
 
-    // Ignore non-TEAM bot chatter (prevents bot-to-bot loops)
+    // Ignore non-TEAM bot chatter
     if (isBotSender) return;
 
     // Human-triggered replanning
@@ -148,14 +148,15 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
         trigger: "human"
       });
 
-      safeChat(say || "Got it.");
+      // ✅ No more "Got it." fallback
+      safeChat(say || `I heard you: "${humanText}". What should I do first?`);
 
       bot.pathfinder.setGoal(null);
       bot._planQueue = Array.isArray(plan) && plan.length ? plan : [{ type: "WANDER" }];
       bot._current = null;
     } catch (e) {
       console.error(`[${bot.username}] chat planning error:`, (e && e.message) ? e.message : e);
-      safeChat("Brain hiccup—try again.");
+      safeChat("I had trouble thinking—can you repeat that?");
     } finally {
       bot._planning = false;
     }
@@ -194,7 +195,7 @@ async function createAgent({ host, port, persona, username, allBotNames }) {
       } else if (type === "RETURN_BASE") {
         const b = getBase(bot);
         if (!b) {
-          safeChat("No base set.");
+          safeChat("I don't have a base saved yet.");
           bot._planQueue.shift();
         } else {
           goto(bot, b.x, b.y, b.z);
