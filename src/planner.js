@@ -5,7 +5,7 @@ const { drainMessages } = require("./inbox");
 const { logPlan } = require("./llm_logger");
 
 const MODEL = "gpt-5-mini";
-const MAX_OUTPUT_TOKENS = 560;
+const MAX_OUTPUT_TOKENS = 1000;
 
 // Cache OpenAI client via dynamic import (CJS compatible with ESM SDK)
 let _client = null;
@@ -135,20 +135,25 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   const menuStr = menu.join("\n");
 
   async function doCall(extraNudge) {
-    return client.responses.create({
-      model: MODEL,
-      input: [
-        { role: "system", content: systemStr },
-        {
-          role: "user",
-          content: extraNudge ? `${menuStr}\n\n${extraNudge}` : menuStr
-        }
-      ],
-      // ✅ Hard-enforce JSON output
-      response_format: { type: "json_object" },
-      max_output_tokens: MAX_OUTPUT_TOKENS
-    });
-  }
+  return client.responses.create({
+    model: MODEL,
+    input: [
+      { role: "system", content: systemStr },
+      {
+        role: "user",
+        content: extraNudge ? `${menuStr}\n\n${extraNudge}` : menuStr
+      }
+    ],
+    // ✅ New location for JSON enforcement in Responses API
+    text: {
+      format: { type: "json_object" },
+      // optional: can reduce verbosity a bit if supported by your model/account
+      // verbosity: "low"
+    },
+    max_output_tokens: MAX_OUTPUT_TOKENS
+  });
+}
+
 
   let resp;
   let text = "";
