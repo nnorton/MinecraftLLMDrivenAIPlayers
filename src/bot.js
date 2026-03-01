@@ -25,6 +25,10 @@ const TASK_TICK_MS = 1500;
 const COOLDOWN_ON_HUMAN_MS = 1500;
 const WANDER_RADIUS = 30;
 
+// ✅ Memory reducer: Mineflayer chunk radius per bot
+// Suggested: 2-4. Default here is 3.
+const BOT_VIEW_DISTANCE = parseInt(process.env.BOT_VIEW_DISTANCE || "3", 10);
+
 // ---- “Always busy” controls ----
 const WANDER_MAX_MS = parseInt(process.env.WANDER_MAX_MS || "45000", 10);
 const STEP_TIMEOUT_MS = parseInt(process.env.STEP_TIMEOUT_MS || "180000", 10);
@@ -63,7 +67,14 @@ function posObj(bot) {
 async function createAgent(opts) {
   const { host, port, persona, username, allBotNames } = opts;
 
-  const bot = mineflayer.createBot({ host, port, username });
+  // ✅ Apply viewDistance here
+  const bot = mineflayer.createBot({
+    host,
+    port,
+    username,
+    viewDistance: BOT_VIEW_DISTANCE,
+  });
+
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(collectBlock);
   bot.loadPlugin(toolPlugin);
@@ -86,13 +97,13 @@ async function createAgent(opts) {
   bot._lastMoveAt = Date.now();
   bot._wanderStartedAt = 0;
   bot._stepStartedAt = 0;
-
   bot._lastUnstuckAt = 0;
   bot._lastGoalChangeAt = 0;
   bot._unstuckStage1At = 0;
 
   // Chat throttle
   bot._lastChatAt = 0;
+
   function safeChat(msg) {
     const t = Date.now();
     if (t - bot._lastChatAt < 1100) return;
@@ -130,9 +141,11 @@ async function createAgent(opts) {
     if (reconnectScheduled) return;
     reconnectScheduled = true;
     cleanupTimers();
+
     reconnectAttempts += 1;
     const delay = Math.min(5000 * reconnectAttempts, 60000);
     console.log(`[${username}] reconnecting in ${Math.round(delay / 1000)}s (reason=${reason})`);
+
     setTimeout(() => {
       try {
         createAgent(opts);
@@ -216,7 +229,6 @@ async function createAgent(opts) {
     if (now - bot._lastGoalChangeAt < GOAL_GRACE_MS) return;
 
     const p = bot.entity.position;
-
     if (!bot._lastPos) {
       bot._lastPos = p.clone();
       bot._lastMoveAt = now;
@@ -246,12 +258,10 @@ async function createAgent(opts) {
         bot._current = null;
         if (bot._planQueue && bot._planQueue.length) bot._planQueue.shift();
         bot._planQueue = [pickNextTask(bot)];
-
         bot._lastUnstuckAt = now;
         bot._unstuckStage1At = 0;
         bot._lastPos = p.clone();
         bot._lastMoveAt = now;
-
         safeChat("(unstuck)");
       }
     }
@@ -270,7 +280,6 @@ async function createAgent(opts) {
     }
 
     safeChat(`(${bot.username}) online.`);
-
     bot._planQueue = [pickNextTask(bot)];
     bot._wanderStartedAt = 0;
 
@@ -292,13 +301,13 @@ async function createAgent(opts) {
           });
 
           if (say) safeChat(say);
+
           bot.pathfinder.setGoal(null);
           bot._planQueue = Array.isArray(plan) && plan.length ? plan : [pickNextTask(bot)];
           bot._current = null;
           bot._lastAutonomyAt = Date.now();
           bot._wanderStartedAt = 0;
           bot._teamDirty = false;
-
           bot._lastGoalChangeAt = Date.now();
         } catch (e) {
           console.error(`[${bot.username}] autonomy planning error:`, e?.message || e);
@@ -315,11 +324,14 @@ async function createAgent(opts) {
             if (!bot.entity) return;
             if (bot._planning || bot._executing) return;
             if (Math.random() > SOCIAL_PING_PROB) return;
+
             const others = allBotNames ? Array.from(allBotNames).filter((n) => n !== bot.username) : [];
             if (!others.length) return;
+
             const target = others[Math.floor(Math.random() * others.length)];
             const now = Date.now();
             if (now - bot._lastDmAt < BOT_DM_RATE_MS) return;
+
             bot._lastDmAt = now;
             safeChat(`@${target} status check — what are you working on?`);
           } catch {}
@@ -330,6 +342,7 @@ async function createAgent(opts) {
 
   bot.on("chat", async (sender, message) => {
     if (sender === bot.username) return;
+
     const isBotSender = allBotNames && allBotNames.has(sender);
 
     if (String(message).startsWith(TEAM_PREFIX)) {
@@ -356,8 +369,8 @@ async function createAgent(opts) {
 
     if (!isMentionToMe) return;
     if (Date.now() - bot._lastHumanAt < COOLDOWN_ON_HUMAN_MS) return;
-    bot._lastHumanAt = Date.now();
 
+    bot._lastHumanAt = Date.now();
     const humanText = message.slice(mention.length).trim();
     if (bot._planning) return;
 
@@ -371,12 +384,12 @@ async function createAgent(opts) {
       });
 
       safeChat(say || `I heard you: "${humanText}". What should I do first?`);
+
       bot.pathfinder.setGoal(null);
       bot._planQueue = Array.isArray(plan) && plan.length ? plan : [pickNextTask(bot)];
       bot._current = null;
       bot._wanderStartedAt = 0;
       bot._teamDirty = false;
-
       bot._lastGoalChangeAt = Date.now();
     } catch (e) {
       console.error(`[${bot.username}] chat planning error:`, e?.message || e);
@@ -407,7 +420,6 @@ async function createAgent(opts) {
     updateMovementWatchdog();
 
     if (tickMovement(bot)) return;
-
     if (bot._executing) return;
     if (!bot._planQueue || bot._planQueue.length === 0) return;
 
@@ -415,12 +427,13 @@ async function createAgent(opts) {
       try {
         bot.pathfinder.setGoal(null);
       } catch {}
+
       bot._current = null;
       if (bot._planQueue.length) bot._planQueue.shift();
       bot._planQueue = [pickNextTask(bot)];
       bot._stepStartedAt = 0;
-      safeChat("(timed out, switching tasks)");
 
+      safeChat("(timed out, switching tasks)");
       postEvent(bot.username, `[TEAM] step timeout`, "action_fail", {
         type: "STEP_TIMEOUT",
         reason: "step exceeded STEP_TIMEOUT_MS",
@@ -433,6 +446,7 @@ async function createAgent(opts) {
     const type = normalizeType(step.type);
 
     bot._executing = true;
+
     if (!bot._stepStartedAt) bot._stepStartedAt = Date.now();
 
     const startedAt = Date.now();
@@ -443,10 +457,12 @@ async function createAgent(opts) {
         const txt = String(step.text || "");
         const isDm = txt.trim().startsWith("@");
         const now = Date.now();
+
         if (!isDm || now - bot._lastDmAt >= BOT_DM_RATE_MS) {
           if (isDm) bot._lastDmAt = now;
           safeChat(txt);
         }
+
         bot._planQueue.shift();
         bot._current = null;
         bot._stepStartedAt = 0;
@@ -520,7 +536,13 @@ async function createAgent(opts) {
         bot._stepStartedAt = 0;
       }
 
-      if (type !== "SAY" && type !== "WANDER" && type !== "FOLLOW" && type !== "GOTO" && type !== "RETURN_BASE") {
+      if (
+        type !== "SAY" &&
+        type !== "WANDER" &&
+        type !== "FOLLOW" &&
+        type !== "GOTO" &&
+        type !== "RETURN_BASE"
+      ) {
         postEvent(bot.username, `${TEAM_PREFIX} ok ${type}`, "action_ok", {
           type,
           ms: Date.now() - startedAt,
@@ -530,7 +552,6 @@ async function createAgent(opts) {
       }
     } catch (e) {
       console.error(`[${bot.username}] step failed`, e?.message || e);
-
       postEvent(bot.username, `${TEAM_PREFIX} fail ${type}: ${shortErr(e)}`, "action_fail", {
         type,
         reason: shortErr(e),
@@ -538,7 +559,6 @@ async function createAgent(opts) {
         pos: stepPos,
         pos2: posObj(bot),
       });
-
       bot._planQueue.shift();
       bot._current = null;
       bot._stepStartedAt = 0;

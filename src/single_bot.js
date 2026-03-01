@@ -1,4 +1,4 @@
-// src/index.js
+// src/single_bot.js
 require("dotenv").config();
 
 const personas = require("../personas");
@@ -7,9 +7,9 @@ const { createAgent } = require("./bot");
 const HOST = process.env.MC_HOST;
 const PORT = parseInt(process.env.MC_PORT || "25565", 10);
 
-// Pick bot via env or CLI arg:
-//   BOT_NAME=BeaconBill node src/index.js
-//   node src/index.js BeaconBill
+// You can pass BOT_NAME as env var or as a CLI arg:
+//   BOT_NAME=ForemanFinn node src/single_bot.js
+//   node src/single_bot.js ForemanFinn
 const BOT_NAME = process.env.BOT_NAME || process.argv[2];
 
 async function main() {
@@ -17,23 +17,19 @@ async function main() {
     console.error("Missing MC_HOST in env");
     process.exit(1);
   }
-
   if (!BOT_NAME) {
-    console.error(
-      "Missing BOT_NAME (env) or username argument.\n" +
-        "Example: BOT_NAME=BeaconBill node src/index.js"
-    );
+    console.error("Missing BOT_NAME (env) or username argument.\nExample: BOT_NAME=ForemanFinn node src/single_bot.js");
     process.exit(1);
   }
 
-  const cfg = personas.find((p) => p.username === BOT_NAME);
+  const cfg = personas.find(p => p.username === BOT_NAME);
   if (!cfg) {
     console.error(`BOT_NAME "${BOT_NAME}" not found in personas.js`);
-    console.error(`Available: ${personas.map((p) => p.username).join(", ")}`);
+    console.error(`Available: ${personas.map(p => p.username).join(", ")}`);
     process.exit(1);
   }
 
-  const allBotNames = new Set(personas.map((p) => p.username));
+  const allBotNames = new Set(personas.map(p => p.username));
 
   console.log(`Starting single bot process: ${cfg.username}`);
   console.log(`Connecting to ${HOST}:${PORT}`);
@@ -47,7 +43,7 @@ async function main() {
   });
 }
 
-main().catch((err) => {
-  console.error("Fatal error in src/index.js:", err);
+main().catch(err => {
+  console.error("Fatal error in single_bot.js:", err);
   process.exit(1);
 });
