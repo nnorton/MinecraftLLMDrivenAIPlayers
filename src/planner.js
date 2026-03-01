@@ -34,6 +34,29 @@ function summarizeInventory(bot, limit = 12) {
 }
 
 /**
+ * Responses API sometimes returns content in output parts instead of output_text.
+ * This safely extracts text across shapes.
+ */
+function extractText(resp) {
+  const t1 = (resp?.output_text || "").trim();
+  if (t1) return t1;
+
+  const outs = resp?.output || [];
+  const chunks = [];
+
+  for (const o of outs) {
+    const content = o?.content || [];
+    for (const c of content) {
+      if (typeof c?.text === "string" && c.text.trim()) chunks.push(c.text.trim());
+      if (typeof c?.content === "string" && c.content.trim()) chunks.push(c.content.trim());
+      if (typeof c?.output_text === "string" && c.output_text.trim()) chunks.push(c.output_text.trim());
+    }
+  }
+
+  return chunks.join("\n").trim();
+}
+
+/**
  * Returns: { say: string, plan: Array<Action> }
  */
 async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonomy" }) {
@@ -94,14 +117,12 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   }
   if (invSummary) menu.push(`Inventory(top): ${invSummary}`);
 
-  // TEAM updates (shared context)
   const ev = recentEvents(10 * 60 * 1000, 12);
   if (ev.length) {
     menu.push("", "Recent TEAM updates (optional context):");
     for (const e of ev) menu.push(`- ${e.from}: ${e.text}`);
   }
 
-  // ✅ Direct messages (per-bot inbox)
   const dms = drainMessages(bot.username, 8);
   if (dms.length) {
     menu.push("", "Direct messages to you (reply helpfully):");
@@ -113,44 +134,72 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   const systemStr = String(systemPrompt || "").trim();
   const menuStr = menu.join("\n");
 
+  async function doCall(extraNudge) {
+    return client.responses.create({
+      model: MODEL,
+      input: [
+        { role: "system", content: systemStr },
+        {
+          role: "user",
+          content: extraNudge ? `${menuStr}\n\n${extraNudge}` : menuStr
+        }
+      ],
+      // ✅ Hard-enforce JSON output
+      response_format: { type: "json_object" },
+      max_output_tokens: MAX_OUTPUT_TOKENS
+    });
+  }
+
   let resp;
   let text = "";
 
   try {
-    resp = await client.responses.create({
-      model: MODEL,
-      input: [
-        { role: "system", content: systemStr },
-        { role: "user", content: menuStr }
-      ],
-      max_output_tokens: MAX_OUTPUT_TOKENS
-    });
-
-    text = (resp.output_text || "").trim();
+    resp = await doCall(null);
+    text = extractText(resp);
 
     logPlan({
       bot: bot.username,
       trigger,
       model: MODEL,
       output_text: text,
-      usage: resp.usage || null,
+      usage: resp?.usage || null,
       request: {
         system: systemStr.slice(0, 2000),
         user: humanMessage ? String(humanMessage).slice(0, 500) : null,
         menu: menuStr.slice(0, 4000),
       }
     });
+
+    // ✅ If empty, do one retry with a nudge (prevents parse errors)
+    if (!text) {
+      logPlan({ bot: bot.username, trigger, model: MODEL, empty_output_text: true });
+
+      const resp2 = await doCall(
+        "IMPORTANT: Your last response was empty. Return VALID JSON matching the schema now."
+      );
+      const text2 = extractText(resp2);
+
+      logPlan({
+        bot: bot.username,
+        trigger,
+        model: MODEL,
+        retry_output_text: text2,
+        usage: resp2?.usage || null
+      });
+
+      text = text2;
+    }
+
+    // ✅ Still empty? fall back safely.
+    if (!text) {
+      return { say: "", plan: [{ type: "WANDER" }] };
+    }
   } catch (err) {
     logPlan({
       bot: bot.username,
       trigger,
       model: MODEL,
-      request_error: String(err?.message || err),
-      request: {
-        system: systemStr.slice(0, 2000),
-        user: humanMessage ? String(humanMessage).slice(0, 500) : null,
-        menu: menuStr.slice(0, 4000),
-      }
+      request_error: String(err?.message || err)
     });
     throw err;
   }
