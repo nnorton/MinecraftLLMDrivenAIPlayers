@@ -23,7 +23,7 @@ const gather = require("./actions/gather");
 const AUTONOMY_INTERVAL_MS = 5 * 60 * 1000;
 const TASK_TICK_MS = 1500;
 const COOLDOWN_ON_HUMAN_MS = 1500;
-const WANDER_RADIUS = 10;
+const WANDER_RADIUS = 30;
 
 // ---- “Always busy” controls ----
 const WANDER_MAX_MS = parseInt(process.env.WANDER_MAX_MS || "45000", 10); // after this, pick real task
