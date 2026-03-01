@@ -30,6 +30,11 @@ const WANDER_MAX_MS = parseInt(process.env.WANDER_MAX_MS || "45000", 10);
 const STEP_TIMEOUT_MS = parseInt(process.env.STEP_TIMEOUT_MS || "180000", 10);
 const STUCK_NO_MOVE_MS = parseInt(process.env.STUCK_NO_MOVE_MS || "20000", 10);
 
+// ✅ New: anti-spam + grace periods
+const UNSTUCK_COOLDOWN_MS = parseInt(process.env.UNSTUCK_COOLDOWN_MS || "60000", 10); // 60s
+const GOAL_GRACE_MS = parseInt(process.env.GOAL_GRACE_MS || "6000", 10); // 6s after goal change
+const UNSTUCK_STAGE1_MS = parseInt(process.env.UNSTUCK_STAGE1_MS || "8000", 10); // stage1 attempt window
+
 // ---- Team influence controls ----
 const TEAM_PREFIX = "[TEAM]";
 const TEAM_EVENT_RATE_MS = 2500;
@@ -82,6 +87,11 @@ async function createAgent(opts) {
   bot._wanderStartedAt = 0;
   bot._stepStartedAt = 0;
 
+  // ✅ New: unstuck control state
+  bot._lastUnstuckAt = 0;
+  bot._lastGoalChangeAt = 0;
+  bot._unstuckStage1At = 0;
+
   // Chat throttle
   bot._lastChatAt = 0;
   function safeChat(msg) {
@@ -92,6 +102,16 @@ async function createAgent(opts) {
       bot.chat(clampChat(msg));
     } catch {}
   }
+
+  // Track goal changes for grace period
+  try {
+    bot.pathfinder.on("goal_updated", () => {
+      bot._lastGoalChangeAt = Date.now();
+      // reset movement baseline on new goal to avoid immediate false unstuck
+      bot._lastPos = bot.entity?.position ? bot.entity.position.clone() : bot._lastPos;
+      bot._lastMoveAt = Date.now();
+    });
+  } catch {}
 
   // --------------------------
   // Reconnect / backoff state
@@ -126,13 +146,12 @@ async function createAgent(opts) {
     }, delay);
   }
 
-  function ensureWork(reason = "ensureWork") {
+  function ensureWork() {
     if (!bot.entity) return;
     if (bot._planning) return;
     if (bot._executing) return;
 
     // If team intel arrived recently, do a cheap replan (no LLM)
-    // Only override if we're idle or wandering.
     if (bot._teamDirty) {
       const head = bot._planQueue?.[0];
       const headType = head ? normalizeType(head.type) : "";
@@ -147,7 +166,6 @@ async function createAgent(opts) {
       }
     }
 
-    // If no plan, immediately pick a concrete task
     if (!bot._planQueue || bot._planQueue.length === 0) {
       bot._planQueue = [pickNextTask(bot)];
       bot._current = null;
@@ -172,50 +190,85 @@ async function createAgent(opts) {
     }
   }
 
-  // ✅ CHANGE: Only apply the “unstuck” watchdog when the bot is supposed to be moving
+  function isMovementAction() {
+    const step = bot._planQueue?.[0];
+    const type = normalizeType(step?.type);
+    return type === "GOTO" || type === "FOLLOW" || type === "RETURN_BASE" || type === "WANDER";
+  }
+
+  async function doUnstuckStage1() {
+    // Small “wiggle” attempt that often solves fence/corner jitter without nuking the plan
+    try {
+      bot.setControlState("jump", true);
+      bot.setControlState("left", true);
+      bot.setControlState("forward", true);
+      setTimeout(() => {
+        try {
+          bot.setControlState("jump", false);
+          bot.setControlState("left", false);
+          bot.setControlState("forward", false);
+        } catch {}
+      }, 900);
+    } catch {}
+  }
+
   function updateMovementWatchdog() {
     if (!bot.entity) return;
 
-    // Determine whether the current top-of-queue action expects movement.
-    const step = bot._planQueue?.[0];
-    const type = normalizeType(step?.type);
+    // Only apply to movement actions
+    if (!isMovementAction()) return;
 
-    const movementActions = new Set(["GOTO", "FOLLOW", "RETURN_BASE", "WANDER"]);
+    const now = Date.now();
 
-    // If we are not currently doing a movement action, do not “unstuck” based on position delta.
-    // This prevents false positives during crafting/mining/building/combat/inventory work.
-    if (!movementActions.has(type)) {
-      // Still update tracking baseline so we don't accumulate stale timers.
-      bot._lastPos = bot.entity.position.clone();
-      bot._lastMoveAt = Date.now();
-      return;
-    }
+    // Cooldown so it can't spam
+    if (now - bot._lastUnstuckAt < UNSTUCK_COOLDOWN_MS) return;
+
+    // Grace period after goal changes
+    if (now - bot._lastGoalChangeAt < GOAL_GRACE_MS) return;
 
     const p = bot.entity.position;
 
     if (!bot._lastPos) {
       bot._lastPos = p.clone();
-      bot._lastMoveAt = Date.now();
+      bot._lastMoveAt = now;
       return;
     }
 
     const moved = p.distanceTo(bot._lastPos) > 0.25;
     if (moved) {
       bot._lastPos = p.clone();
-      bot._lastMoveAt = Date.now();
+      bot._lastMoveAt = now;
+      bot._unstuckStage1At = 0;
       return;
     }
 
-    if (Date.now() - bot._lastMoveAt > STUCK_NO_MOVE_MS) {
-      try {
-        bot.pathfinder.setGoal(null);
-      } catch {}
-      bot._current = null;
-      if (bot._planQueue && bot._planQueue.length) bot._planQueue.shift();
-      bot._planQueue = [pickNextTask(bot)];
-      bot._lastMoveAt = Date.now();
-      bot._lastPos = p.clone();
-      safeChat("(unstuck)");
+    // If we haven't moved for a while…
+    if (now - bot._lastMoveAt > STUCK_NO_MOVE_MS) {
+      // Stage 1: try a quick wiggle first (once), then wait a bit
+      if (!bot._unstuckStage1At) {
+        bot._unstuckStage1At = now;
+        doUnstuckStage1();
+        // Give it some time to resolve without spamming chat
+        bot._lastMoveAt = now;
+        return;
+      }
+
+      // If stage1 didn't help after a window, Stage 2: cancel goal + new task
+      if (now - bot._unstuckStage1At > UNSTUCK_STAGE1_MS) {
+        try {
+          bot.pathfinder.setGoal(null);
+        } catch {}
+        bot._current = null;
+        if (bot._planQueue && bot._planQueue.length) bot._planQueue.shift();
+        bot._planQueue = [pickNextTask(bot)];
+
+        bot._lastUnstuckAt = now;
+        bot._unstuckStage1At = 0;
+        bot._lastPos = p.clone();
+        bot._lastMoveAt = now;
+
+        safeChat("(unstuck)");
+      }
     }
   }
 
@@ -233,13 +286,11 @@ async function createAgent(opts) {
 
     safeChat(`(${bot.username}) online.`);
 
-    // Start doing real work immediately
     bot._planQueue = [pickNextTask(bot)];
     bot._wanderStartedAt = 0;
 
     intervalIds.push(setInterval(() => tick(bot), TASK_TICK_MS));
 
-    // Autonomy loop stays as-is (LLM cadence unchanged)
     intervalIds.push(
       setInterval(async () => {
         if (!bot.entity) return;
@@ -262,6 +313,9 @@ async function createAgent(opts) {
           bot._lastAutonomyAt = Date.now();
           bot._wanderStartedAt = 0;
           bot._teamDirty = false;
+
+          // goal grace
+          bot._lastGoalChangeAt = Date.now();
         } catch (e) {
           console.error(`[${bot.username}] autonomy planning error:`, e?.message || e);
         } finally {
@@ -270,7 +324,6 @@ async function createAgent(opts) {
       }, 15000)
     );
 
-    // Social ping loop (optional)
     if (ENABLE_SOCIAL_PING) {
       intervalIds.push(
         setInterval(() => {
@@ -295,14 +348,11 @@ async function createAgent(opts) {
     if (sender === bot.username) return;
     const isBotSender = allBotNames && allBotNames.has(sender);
 
-    // TEAM bus messages (throttle)
     if (String(message).startsWith(TEAM_PREFIX)) {
       const t = Date.now();
       if (t - bot._lastTeamEventAt > TEAM_EVENT_RATE_MS) {
         bot._lastTeamEventAt = t;
         postEvent(sender, message, "team", { ts: t });
-
-        // mark team intel dirty, but do NOT call LLM here
         bot._teamDirty = true;
         bot._teamDirtyAt = t;
       }
@@ -312,7 +362,6 @@ async function createAgent(opts) {
     const mention = `@${bot.username}`;
     const isMentionToMe = message.toLowerCase().startsWith(mention.toLowerCase());
 
-    // Bot-to-bot DM inbox
     if (isBotSender) {
       if (isMentionToMe) {
         const dmText = message.slice(mention.length).trim();
@@ -321,7 +370,6 @@ async function createAgent(opts) {
       return;
     }
 
-    // Human mention -> immediate LLM plan
     if (!isMentionToMe) return;
     if (Date.now() - bot._lastHumanAt < COOLDOWN_ON_HUMAN_MS) return;
     bot._lastHumanAt = Date.now();
@@ -344,6 +392,8 @@ async function createAgent(opts) {
       bot._current = null;
       bot._wanderStartedAt = 0;
       bot._teamDirty = false;
+
+      bot._lastGoalChangeAt = Date.now();
     } catch (e) {
       console.error(`[${bot.username}] chat planning error:`, e?.message || e);
       safeChat("I had trouble thinking—can you repeat that?");
@@ -369,17 +419,16 @@ async function createAgent(opts) {
   async function tick(bot) {
     if (!bot.entity) return;
 
-    // Always-busy enforcement + stuck detection (movement-only now)
-    ensureWork("tick");
+    ensureWork();
+
+    // Movement watchdog (now with grace + cooldown + staged)
     updateMovementWatchdog();
 
-    // If movement subsystem is handling something, let it run
     if (tickMovement(bot)) return;
 
     if (bot._executing) return;
     if (!bot._planQueue || bot._planQueue.length === 0) return;
 
-    // Step timeout watchdog
     if (bot._stepStartedAt && Date.now() - bot._stepStartedAt > STEP_TIMEOUT_MS) {
       try {
         bot.pathfinder.setGoal(null);
@@ -390,7 +439,6 @@ async function createAgent(opts) {
       bot._stepStartedAt = 0;
       safeChat("(timed out, switching tasks)");
 
-      // report timeout as failure
       postEvent(bot.username, `[TEAM] step timeout`, "action_fail", {
         type: "STEP_TIMEOUT",
         reason: "step exceeded STEP_TIMEOUT_MS",
@@ -420,8 +468,6 @@ async function createAgent(opts) {
         bot._planQueue.shift();
         bot._current = null;
         bot._stepStartedAt = 0;
-
-        // (optional) don't spam bus for SAY
       } else if (type === "WANDER") {
         wander(bot, WANDER_RADIUS);
         bot._stepStartedAt = 0;
@@ -491,7 +537,6 @@ async function createAgent(opts) {
         bot._stepStartedAt = 0;
       }
 
-      // report success for non-trivial steps
       if (type !== "SAY" && type !== "WANDER" && type !== "FOLLOW" && type !== "GOTO" && type !== "RETURN_BASE") {
         postEvent(bot.username, `${TEAM_PREFIX} ok ${type}`, "action_ok", {
           type,
@@ -503,7 +548,6 @@ async function createAgent(opts) {
     } catch (e) {
       console.error(`[${bot.username}] step failed`, e?.message || e);
 
-      // report failure (critical for planner to avoid loops)
       postEvent(bot.username, `${TEAM_PREFIX} fail ${type}: ${shortErr(e)}`, "action_fail", {
         type,
         reason: shortErr(e),
@@ -517,7 +561,7 @@ async function createAgent(opts) {
       bot._stepStartedAt = 0;
     } finally {
       bot._executing = false;
-      ensureWork("finally");
+      ensureWork();
     }
   }
 
