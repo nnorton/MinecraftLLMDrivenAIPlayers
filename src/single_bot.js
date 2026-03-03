@@ -1,6 +1,15 @@
 // src/single_bot.js
 require("dotenv").config();
 
+// Keep the process alive on unexpected async errors. PM2 can still restart us,
+// but avoiding hard crashes reduces bot dropouts.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[${process.env.BOT_NAME || process.argv[2] || "bot"}] unhandledRejection:`, reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error(`[${process.env.BOT_NAME || process.argv[2] || "bot"}] uncaughtException:`, err);
+});
+
 const personas = require("../personas");
 const { createAgent } = require("./bot");
 
@@ -22,14 +31,14 @@ async function main() {
     process.exit(1);
   }
 
-  const cfg = personas.find(p => p.username === BOT_NAME);
+  const cfg = personas.find((p) => p.username === BOT_NAME);
   if (!cfg) {
     console.error(`BOT_NAME "${BOT_NAME}" not found in personas.js`);
-    console.error(`Available: ${personas.map(p => p.username).join(", ")}`);
+    console.error(`Available: ${personas.map((p) => p.username).join(", ")}`);
     process.exit(1);
   }
 
-  const allBotNames = new Set(personas.map(p => p.username));
+  const allBotNames = new Set(personas.map((p) => p.username));
 
   console.log(`Starting single bot process: ${cfg.username}`);
   console.log(`Connecting to ${HOST}:${PORT}`);
@@ -43,7 +52,7 @@ async function main() {
   });
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error("Fatal error in single_bot.js:", err);
   process.exit(1);
 });

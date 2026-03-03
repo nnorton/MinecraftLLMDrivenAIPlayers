@@ -1,6 +1,15 @@
 // src/index.js
 require("dotenv").config();
 
+// Keep the process alive on unexpected async errors. PM2 can still restart us,
+// but avoiding hard crashes reduces bot dropouts.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[${process.env.BOT_NAME || process.argv[2] || "bot"}] unhandledRejection:`, reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error(`[${process.env.BOT_NAME || process.argv[2] || "bot"}] uncaughtException:`, err);
+});
+
 const personas = require("../personas");
 const { createAgent } = require("./bot");
 
@@ -20,8 +29,7 @@ async function main() {
 
   if (!BOT_NAME) {
     console.error(
-      "Missing BOT_NAME (env) or username argument.\n" +
-        "Example: BOT_NAME=BeaconBill node src/index.js"
+      "Missing BOT_NAME (env) or username argument.\n" + "Example: BOT_NAME=BeaconBill node src/index.js"
     );
     process.exit(1);
   }

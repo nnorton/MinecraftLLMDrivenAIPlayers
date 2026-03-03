@@ -22,17 +22,15 @@ const gather = require("./actions/gather");
 
 // ---- Controls ----
 const AUTONOMY_INTERVAL_MS = 5 * 60 * 1000;
-const TASK_TICK_MS = 1500;
+const TASK_TICK_MS = parseInt(process.env.TASK_TICK_MS || "1500", 10);
 const COOLDOWN_ON_HUMAN_MS = 1500;
-const WANDER_RADIUS = 30;
+const WANDER_RADIUS = parseInt(process.env.WANDER_RADIUS || "30", 10);
 
 // ✅ Memory reducer: Mineflayer chunk radius per bot
 // Suggested: 2-4. Default here is 3.
 const BOT_VIEW_DISTANCE = parseInt(process.env.BOT_VIEW_DISTANCE || "3", 10);
 
 // ---- LLM on/off switch ----
-// Set LLM_ENABLED=false in .env to completely disable OpenAI usage.
-// When disabled, bots will only use deterministic/non-LLM task logic.
 function parseBool(v, defVal = true) {
   if (v === undefined || v === null || v === "") return defVal;
   const s = String(v).trim().toLowerCase();
@@ -41,6 +39,8 @@ function parseBool(v, defVal = true) {
   return defVal;
 }
 const LLM_ENABLED = parseBool(process.env.LLM_ENABLED, true);
+
+const DEBUG_BOT = String(process.env.DEBUG_BOT || "").toLowerCase() === "true";
 
 // ---- Pathfinder tuning ----
 const PATHFINDER_THINK_TIMEOUT_MS = parseInt(
@@ -68,6 +68,13 @@ const UNSTUCK_STAGE1_MS = parseInt(process.env.UNSTUCK_STAGE1_MS || "9000", 10);
 // ---- Team influence controls ----
 const TEAM_PREFIX = "[TEAM]";
 const TEAM_EVENT_RATE_MS = 2500;
+
+function dbg(bot, msg) {
+  if (!DEBUG_BOT) return;
+  try {
+    console.log(`[${bot.username}] ${msg}`);
+  } catch {}
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -105,13 +112,6 @@ function isMajorStepType(type) {
     type === "SMELT_ORE" ||
     type === "FIGHT_MOBS"
   );
-}
-
-function invCount(bot, itemName) {
-  const items = bot.inventory?.items?.() || [];
-  let total = 0;
-  for (const it of items) if (it.name === itemName) total += it.count || 0;
-  return total;
 }
 
 function parseInsufficientMaterial(errMsg) {
@@ -175,7 +175,7 @@ function deterministicPlan(bot, humanMessage) {
   if (msg.includes("wood") || msg.includes("logs")) {
     return [
       { type: "SAY", text: "On it — gathering wood." },
-      { type: "GATHER_WOOD", count: 12 },
+      { type: "GATHER_WOOD", count: 12, radius: 64 },
     ];
   }
 
@@ -218,8 +218,7 @@ function remediateInsufficientMaterial({ bot, step, parsed }) {
       ok: true,
       reason: `gather_wood_for_${material}`,
       newQueue: [
-        { type: "SAY", text: `I’m short on ${material}. I’ll gather wood and craft planks, then continue.` },
-        { type: "GATHER_WOOD", count: Math.max(6, Math.ceil(wantExtra / 4)) },
+        { type: "GATHER_WOOD", count: 12, radius: 80 },
         { type: "CRAFT_TOOLS" },
         step,
       ],
@@ -229,10 +228,9 @@ function remediateInsufficientMaterial({ bot, step, parsed }) {
   if (!mineTarget) {
     return {
       ok: true,
-      reason: `fallback_mine_stone_for_${material}`,
+      reason: `fallback_wander_for_${material}`,
       newQueue: [
-        { type: "SAY", text: `I’m short on ${material}. I’ll mine more stone first.` },
-        { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: wantExtra, radius: 48 },
+        { type: "WANDER", radius: 18, maxMs: 12000 },
         step,
       ],
     };
@@ -240,19 +238,13 @@ function remediateInsufficientMaterial({ bot, step, parsed }) {
 
   return {
     ok: true,
-    reason: `mine_${mineTarget}_for_${material}`,
+    reason: `stockpile_${material}`,
     newQueue: [
-      { type: "SAY", text: `I’m short on ${material}. I’ll mine some more, then continue.` },
-      { type: "MINE_BLOCKS", targets: [mineTarget, "coal_ore"], count: wantExtra, radius: 48 },
+      { type: "CRAFT_TOOLS" },
+      { type: "MINE_BLOCKS", targets: [mineTarget, "coal_ore"], count: wantExtra, radius: 72 },
       step,
     ],
   };
-}
-
-function posObj(bot) {
-  const p = bot.entity?.position;
-  if (!p) return null;
-  return { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
 }
 
 async function createAgent(opts) {
@@ -278,20 +270,20 @@ async function createAgent(opts) {
   bot._commitUntil = 0;
   bot._pendingHuman = null;
 
-  bot._lastPos = null;
-  bot._lastMoveAt = Date.now();
-  bot._wanderStartedAt = 0;
-  bot._stepStartedAt = 0;
-  bot._lastUnstuckAt = 0;
-  bot._lastGoalChangeAt = 0;
-  bot._unstuckStage1At = 0;
+  // loop-control + spam control
+  bot._lastStepLogType = null;
+  bot._ensureScheduled = false;
 
-  bot._lastChatAt = 0;
+  function scheduleEnsureWork() {
+    if (bot._ensureScheduled) return;
+    bot._ensureScheduled = true;
+    setImmediate(() => {
+      bot._ensureScheduled = false;
+      ensureWork();
+    });
+  }
 
   function safeChat(msg) {
-    const t = Date.now();
-    if (t - bot._lastChatAt < 900) return;
-    bot._lastChatAt = t;
     try {
       bot.chat(String(msg || "").slice(0, 220));
     } catch {}
@@ -323,6 +315,11 @@ async function createAgent(opts) {
     if (!bot.entity) return;
     if (bot._planning) return;
     if (bot._executing) return;
+
+    // ✅ If we are currently in a movement step, don't restart work.
+    // Movement steps rely on tickMovement() to progress/finish.
+    const curType = normalizeType(bot._current?.type);
+    if (curType === "WANDER" || curType === "GOTO" || curType === "FOLLOW") return;
 
     const now = Date.now();
     const hasWork = bot._planQueue.length > 0;
@@ -356,7 +353,7 @@ async function createAgent(opts) {
           })
           .finally(() => {
             bot._planning = false;
-            ensureWork();
+            scheduleEnsureWork();
           });
         return;
       }
@@ -387,12 +384,18 @@ async function createAgent(opts) {
           })
           .finally(() => {
             bot._planning = false;
-            ensureWork();
+            scheduleEnsureWork();
           });
         return;
       }
 
       bot._planQueue = pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }];
+    }
+
+    const nextType = normalizeType(bot._planQueue?.[0]?.type);
+    if (DEBUG_BOT && nextType && nextType !== bot._lastStepLogType) {
+      bot._lastStepLogType = nextType;
+      dbg(bot, `next step -> ${nextType}`);
     }
 
     executeNextStep().catch(() => {});
@@ -425,8 +428,12 @@ async function createAgent(opts) {
         await sleep(parseInt(step.ms, 10) || 250);
         bot._planQueue.shift();
       } else if (type === "RESET_PATHFINDER") {
-        try { bot.pathfinder.setGoal(null); } catch {}
-        try { bot.clearControlStates(); } catch {}
+        try {
+          bot.pathfinder.setGoal(null);
+        } catch {}
+        try {
+          bot.clearControlStates();
+        } catch {}
         bot._planQueue.shift();
       } else if (type === "SET_BASE") {
         const p = posObj(bot);
@@ -436,6 +443,7 @@ async function createAgent(opts) {
         const r = parseInt(step.radius, 10) || WANDER_RADIUS;
         const maxMs = parseInt(step.maxMs, 10) || WANDER_MAX_MS;
         wander(bot, r, maxMs);
+        // do not shift; tickMovement() will shift when done
       } else if (type === "FOLLOW") {
         follow(bot, step.player);
       } else if (type === "GOTO") {
@@ -449,7 +457,18 @@ async function createAgent(opts) {
           goto(bot, b.x, b.y, b.z);
         }
       } else if (type === "GATHER_WOOD") {
-        await gather.gatherWood(bot, step.count ?? 8);
+        // IMPORTANT: If no trees nearby, gatherWood returns 0 (no throw).
+        // Inject exploration so bots don't stand still forever.
+        const got = await gather.gatherWood(bot, step.count ?? 8, step.radius ?? 64);
+        if (!got || got <= 0) {
+          bot._planQueue = [
+            { type: "WANDER", radius: 24, maxMs: 12000 },
+            { type: "GATHER_WOOD", count: step.count ?? 8, radius: (step.radius ?? 64) + 32 },
+            ...bot._planQueue.slice(1),
+          ];
+          bot._current = null;
+          return;
+        }
         bot._planQueue.shift();
       } else if (type === "MINE_BLOCKS") {
         await gather.mineTargets(
@@ -460,7 +479,12 @@ async function createAgent(opts) {
         );
         bot._planQueue.shift();
       } else if (type === "FARM_HARVEST_REPLANT") {
-        await gather.farmHarvestReplant(bot, step.crops ?? ["wheat", "carrots", "potatoes"], step.max ?? 12);
+        await gather.farmHarvestReplant(
+          bot,
+          step.crops ?? ["wheat", "carrots", "potatoes"],
+          step.max ?? 12,
+          step.radius ?? undefined
+        );
         bot._planQueue.shift();
       } else if (type === "BUILD_STRUCTURE") {
         await buildFort(bot, step);
@@ -472,7 +496,43 @@ async function createAgent(opts) {
         await buildMonumentComplex(bot, step.kind || "OBELISK", step);
         bot._planQueue.shift();
       } else if (type === "CRAFT_TOOLS") {
-        await craftTools(bot);
+        // 🔥 KEY FIX:
+        // craftTools() returns ok:false on "no_logs" (and does not throw),
+        // which previously caused an infinite immediate retry loop.
+        const res = await craftTools(bot);
+
+        if (!res?.ok) {
+          const reason = String(res?.reason || "");
+          const missing = Array.isArray(res?.missing) ? res.missing.map(String) : [];
+
+          // If we can't craft because we have no logs, go get logs (movement),
+          // and if there are no trees nearby, wander to explore first.
+          const needsLogs =
+            reason === "no_logs" ||
+            missing.includes("*_log") ||
+            missing.includes("_log") ||
+            missing.some((m) => m.includes("log"));
+
+          if (needsLogs) {
+            bot._planQueue = [
+              { type: "GATHER_WOOD", count: 12, radius: 64 },
+              { type: "CRAFT_TOOLS" },
+              ...bot._planQueue.slice(1),
+            ];
+            bot._current = null;
+            return;
+          }
+
+          // Generic craft failure: explore a bit then retry once.
+          bot._planQueue = [
+            { type: "WANDER", radius: 18, maxMs: 9000 },
+            { type: "CRAFT_TOOLS" },
+            ...bot._planQueue.slice(1),
+          ];
+          bot._current = null;
+          return;
+        }
+
         bot._planQueue.shift();
       } else if (type === "SMELT_ORE") {
         await smeltOre(bot);
@@ -584,8 +644,15 @@ async function createAgent(opts) {
       bot._current = null;
     } finally {
       bot._executing = false;
-      ensureWork();
+      // ✅ avoid tight recursion loops; schedule for next tick
+      scheduleEnsureWork();
     }
+  }
+
+  function posObj(bot) {
+    const p = bot?.entity?.position;
+    if (!p) return null;
+    return { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
   }
 
   bot.once("spawn", () => {
@@ -600,23 +667,17 @@ async function createAgent(opts) {
       bot.pathfinder.thinkTimeout = PATHFINDER_THINK_TIMEOUT_MS;
     } catch {}
 
-    // --- Startup behavior: avoid calling OpenAI immediately on process start/restart ---
-    // If we have a previously saved successful LLM plan, resume it.
-    // Otherwise, simply delay autonomy planning until the normal interval elapses.
     (async () => {
       try {
-        // Always prevent an immediate autonomy-triggered LLM call on startup.
         bot._lastAutonomyAt = Date.now();
-
         const last = await loadLastLLMPlan(bot.username);
         if (last && Array.isArray(last.plan) && last.plan.length) {
-          // Resume the last instruction without chatting (avoids spam after restarts).
           bot._planQueue = last.plan;
         }
       } catch {
         // ignore
       } finally {
-        ensureWork();
+        scheduleEnsureWork();
       }
     })();
   });
@@ -645,14 +706,14 @@ async function createAgent(opts) {
 
     bot._pendingHuman = { from: username2, text: message, ts: now };
     bot._planQueue = [];
-    ensureWork();
+    scheduleEnsureWork();
   });
 
   const workInterval = setInterval(() => {
     try {
       tickMovement(bot);
     } catch {}
-    ensureWork();
+    scheduleEnsureWork();
   }, TASK_TICK_MS);
 
   bot.on("end", () => {
