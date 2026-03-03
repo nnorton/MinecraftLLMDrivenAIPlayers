@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "saved_at": "2026-03-03T05:16:22.543Z",
+  "hostname": "ip-172-31-32-164",
+  "username": "ScoutSasha",
+  "say": "I'll craft tools, mine stone and ores, then construct a size-9 cobblestone fort.",
+  "intent": "Prepare tools and materials then build a cobblestone fort.",
+  "trigger": "autonomy",
+  "plan": [
+    {
+      "type": "CRAFT_TOOLS"
+    },
+    {
+      "type": "MINE_BLOCKS",
+      "targets": [
+        "coal_ore",
+        "iron_ore",
+        "stone"
+      ],
+      "count": 10
+    },
+    {
+      "type": "BUILD_STRUCTURE",
+      "kind": "FORT",
+      "size": 9,
+      "height": 4,
+      "material": "cobblestone"
+    }
+  ]
+}

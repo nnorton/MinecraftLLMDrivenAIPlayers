@@ -11,6 +11,7 @@ const { planActions } = require("./planner");
 const { postEvent } = require("./team_bus");
 const { pushMessage } = require("./inbox");
 const { pickNextTask } = require("./task_picker");
+const { loadLastLLMPlan } = require("./state_store");
 
 const { goto, follow, wander, tickMovement } = require("./actions/movement");
 const { getBase, setBase } = require("./actions/memory");
@@ -599,7 +600,25 @@ async function createAgent(opts) {
       bot.pathfinder.thinkTimeout = PATHFINDER_THINK_TIMEOUT_MS;
     } catch {}
 
-    ensureWork();
+    // --- Startup behavior: avoid calling OpenAI immediately on process start/restart ---
+    // If we have a previously saved successful LLM plan, resume it.
+    // Otherwise, simply delay autonomy planning until the normal interval elapses.
+    (async () => {
+      try {
+        // Always prevent an immediate autonomy-triggered LLM call on startup.
+        bot._lastAutonomyAt = Date.now();
+
+        const last = await loadLastLLMPlan(bot.username);
+        if (last && Array.isArray(last.plan) && last.plan.length) {
+          // Resume the last instruction without chatting (avoids spam after restarts).
+          bot._planQueue = last.plan;
+        }
+      } catch {
+        // ignore
+      } finally {
+        ensureWork();
+      }
+    })();
   });
 
   bot.on("chat", (username2, message) => {

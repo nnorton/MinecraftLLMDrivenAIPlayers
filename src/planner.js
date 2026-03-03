@@ -5,6 +5,7 @@ const { recentEvents, recentFailuresFor } = require("./team_bus");
 const { drainMessages } = require("./inbox");
 const { logPlan } = require("./llm_logger");
 const { pickNextTask } = require("./task_picker");
+const { saveLastLLMPlan } = require("./state_store");
 
 const MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 const MAX_OUTPUT_TOKENS = parseInt(process.env.OPENAI_MAX_OUTPUT_TOKENS || "1000", 10);
@@ -282,6 +283,20 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   if (nonSay.length === 0) {
     const nonLLMPlan = chooseHelpfulPlanNonLLM({ bot, humanMessage });
     return { say, plan: ensurePlanNonEmpty(bot, nonLLMPlan) };
+  }
+
+  // Persist the last successful LLM instruction so a restarted process can resume work
+  // without immediately calling OpenAI again.
+  // Best-effort; failures here should not affect gameplay.
+  try {
+    await saveLastLLMPlan(bot.username, {
+      say,
+      intent: typeof obj?.intent === "string" ? obj.intent : "",
+      trigger,
+      plan,
+    });
+  } catch {
+    // ignore
   }
 
   return { say, plan };

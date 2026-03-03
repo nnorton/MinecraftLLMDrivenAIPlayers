@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "saved_at": "2026-03-03T05:16:21.071Z",
+  "hostname": "ip-172-31-32-164",
+  "username": "Pennywise",
+  "say": "I'll mine stone and ores, then construct a 9x9 cobblestone fort here.",
+  "intent": "Mine stone then build a cobblestone fort.",
+  "trigger": "autonomy",
+  "plan": [
+    {
+      "type": "MINE_BLOCKS",
+      "targets": [
+        "coal_ore",
+        "iron_ore",
+        "stone"
+      ],
+      "count": 10
+    },
+    {
+      "type": "BUILD_STRUCTURE",
+      "kind": "FORT",
+      "size": 9,
+      "height": 4,
+      "material": "cobblestone"
+    }
+  ]
+}
