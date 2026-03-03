@@ -1,6 +1,7 @@
 // src/actions/gather.js
 const mcDataLoader = require("minecraft-data");
 const { Vec3 } = require("vec3");
+const { ensureBestToolForBlock } = require("../utils/tools");
 
 const DEFAULT_SEARCH_RADIUS = parseInt(process.env.SEARCH_RADIUS || "32", 10);
 const MAX_SEARCH_RADIUS = parseInt(process.env.SEARCH_RADIUS_MAX || "96", 10);
@@ -52,6 +53,11 @@ async function bestEffortCollect(bot, blockPositions, count) {
     try {
       const b = bot.blockAt(pos);
       if (!b) continue;
+
+      // Ensure we have the right tool equipped (pickaxe/axe/shovel/etc.)
+      // before attempting to break the block. Without this, bots often mine/chop
+      // with whatever random item is in-hand (e.g., dirt).
+      await ensureBestToolForBlock(bot, b);
 
       // collectBlock expects Vec3s
       await bot.collectBlock.collect(b);
@@ -146,7 +152,11 @@ async function mineTargets(
   const base = clamp(parseInt(radius, 10) || DEFAULT_SEARCH_RADIUS, 8, MAX_SEARCH_RADIUS);
 
   for (let i = 0; i < tries; i++) {
-    const r = clamp(base + i * Math.floor((MAX_SEARCH_RADIUS - base) / Math.max(1, tries - 1)), 8, MAX_SEARCH_RADIUS);
+    const r = clamp(
+      base + i * Math.floor((MAX_SEARCH_RADIUS - base) / Math.max(1, tries - 1)),
+      8,
+      MAX_SEARCH_RADIUS
+    );
     positions = findBlocksByNames(bot, valid, Math.min(count * 4, 80), r);
     if (positions.length) break;
     await yieldEvery(i, 1, 20);
