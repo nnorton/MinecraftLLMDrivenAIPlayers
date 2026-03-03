@@ -6,3 +6,4 @@ build/
 node_modules/
 mem/
 logs/
+bot_last_commands/
