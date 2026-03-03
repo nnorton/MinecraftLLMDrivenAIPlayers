@@ -3,6 +3,8 @@ const mcDataLoader = require("minecraft-data");
 const { Vec3 } = require("vec3");
 
 const DEFAULT_SEARCH_RADIUS = parseInt(process.env.SEARCH_RADIUS || "32", 10);
+const MAX_SEARCH_RADIUS = parseInt(process.env.SEARCH_RADIUS_MAX || "96", 10);
+const EXPAND_SEARCH_STEPS = parseInt(process.env.SEARCH_RADIUS_EXPAND_STEPS || "3", 10); // how many radius expansions to try
 
 // collectBlock can sometimes throw pathfinder errors like:
 //   "Took to long to decide path to goal!"
@@ -38,108 +40,67 @@ function isPathfinderPlanningError(msg) {
   );
 }
 
-async function bestEffortEquipForBlock(bot, block) {
-  try {
-    if (bot.tool && block) await bot.tool.equipForBlock(block);
-  } catch {}
-}
+async function bestEffortCollect(bot, blockPositions, count) {
+  if (!blockPositions?.length) return 0;
+  const toCollect = blockPositions.slice(0, Math.min(blockPositions.length, count));
+  const collected = [];
 
-function findBlocksByNames(bot, names, count, maxDistance = DEFAULT_SEARCH_RADIUS) {
-  const mcData = mcDataLoader(bot.version);
-
-  const ids = names
-    .map((n) => String(n).trim())
-    .filter((n) => mcData.blocksByName[n])
-    .map((n) => mcData.blocksByName[n].id);
-
-  if (!ids.length) return [];
-
-  return bot.findBlocks({
-    matching: ids,
-    maxDistance,
-    count,
-  });
-}
-
-function byDistanceToBot(bot, blocks) {
-  const p = bot.entity?.position;
-  if (!p) return blocks;
-  return [...blocks].sort((a, b) => {
-    const da = a.position.distanceTo(p);
-    const db = b.position.distanceTo(p);
-    return da - db;
-  });
-}
-
-/**
- * Robust collect:
- * - split into small batches (default 4)
- * - if a batch fails, drop the farthest block in that batch and retry
- * - on repeated path planning timeouts, return what we have so far
- */
-async function collectBlocksRobust(bot, blocks, wantCount, opts = {}) {
-  if (!bot.collectBlock || !bot.collectBlock.collect) {
-    throw new Error("collectBlock plugin not loaded (mineflayer-collectblock).");
-  }
-  if (!blocks.length || wantCount <= 0) return 0;
-
-  const batchSize = clamp(parseInt(opts.batchSize ?? 4, 10) || 4, 1, 8);
-  const maxBatchFailures = clamp(parseInt(opts.maxBatchFailures ?? 6, 10) || 6, 1, 20);
-
-  let collected = 0;
-  let failures = 0;
-
-  // Prioritize nearby blocks first.
-  let queue = byDistanceToBot(bot, blocks);
-
-  await bestEffortEquipForBlock(bot, queue[0]);
-
-  while (queue.length && collected < wantCount) {
-    const remaining = wantCount - collected;
-    const batch = queue.slice(0, Math.min(batchSize, remaining, queue.length));
+  for (let i = 0; i < toCollect.length; i++) {
+    const pos = toCollect[i];
+    await yieldEvery(i, 10, 10);
 
     try {
-      await bot.collectBlock.collect(batch);
-      collected += batch.length;
-      queue = queue.slice(batch.length);
+      const b = bot.blockAt(pos);
+      if (!b) continue;
+
+      // collectBlock expects Vec3s
+      await bot.collectBlock.collect(b);
+      collected.push(pos);
     } catch (e) {
-      failures += 1;
       const msg = shortErr(e);
-
-      // If the pathfinder is timing out planning, don't thrash forever.
-      if (isPathfinderPlanningError(msg) && failures >= 3) {
-        return collected;
+      if (isPathfinderPlanningError(msg)) {
+        // Skip this target; keep going
+        continue;
       }
-
-      // Drop the farthest block in the batch and try again.
-      const p = bot.entity?.position;
-      if (p && batch.length > 1) {
-        batch.sort((a, b) => b.position.distanceTo(p) - a.position.distanceTo(p));
-      }
-      const drop = batch[0];
-      queue = queue.filter((b) => b !== drop);
-
-      if (failures >= maxBatchFailures) {
-        // Stop early but keep any progress we made.
-        return collected;
-      }
-
-      await new Promise((r) => setTimeout(r, 50));
+      // Other errors also skip, but keep making progress
+      continue;
     }
   }
 
-  return collected;
+  return collected.length;
+}
+
+function findBlocksByNames(bot, names, max = 32, radius = DEFAULT_SEARCH_RADIUS) {
+  const mcData = mcDataLoader(bot.version);
+  const ids = names
+    .map((n) => mcData.blocksByName[n]?.id)
+    .filter((id) => Number.isFinite(id));
+
+  if (!ids.length) return [];
+
+  const found = bot.findBlocks({
+    matching: ids,
+    maxDistance: radius,
+    count: max,
+  });
+
+  return found.map((p) => new Vec3(p.x, p.y, p.z));
 }
 
 async function collectPositions(bot, positions, count) {
-  const blocks = positions.map((p) => bot.blockAt(p)).filter(Boolean);
-  if (!blocks.length) return 0;
+  // Batch smaller to avoid aborting on one unreachable block
+  const batchSize = 6;
+  let collected = 0;
 
-  const got = await collectBlocksRobust(bot, blocks, count, {
-    batchSize: 4,
-    maxBatchFailures: 8,
-  });
-  return Math.min(got, count);
+  for (let i = 0; i < positions.length && collected < count; i += batchSize) {
+    const batch = positions.slice(i, i + batchSize);
+    const need = count - collected;
+    const got = await bestEffortCollect(bot, batch, need);
+    collected += got;
+    await yieldEvery(i, 12, 15);
+  }
+
+  return collected;
 }
 
 async function gatherWood(bot, count = 8, radius = DEFAULT_SEARCH_RADIUS) {
@@ -157,9 +118,9 @@ async function gatherWood(bot, count = 8, radius = DEFAULT_SEARCH_RADIUS) {
     "cherry_log",
   ].filter((n) => mcData.blocksByName[n]);
 
-  const positions = findBlocksByNames(bot, logNames, Math.min(count * 3, 40), radius);
+  const positions = findBlocksByNames(bot, logNames, Math.min(count * 3, 48), radius);
   if (!positions.length) {
-    safeChat(bot, "No logs nearby.");
+    safeChat(bot, "No trees nearby.");
     return 0;
   }
 
@@ -179,10 +140,21 @@ async function mineTargets(
   valid = valid.map((t) => t.trim()).filter((t) => mcData.blocksByName[t]);
   if (!valid.length && mcData.blocksByName["stone"]) valid = ["stone"];
 
-  const positions = findBlocksByNames(bot, valid, Math.min(count * 3, 48), radius);
+  // Try progressively larger radii so "mine stone" doesn't instantly no-op and cause thrash.
+  let positions = [];
+  const tries = Math.max(1, EXPAND_SEARCH_STEPS);
+  const base = clamp(parseInt(radius, 10) || DEFAULT_SEARCH_RADIUS, 8, MAX_SEARCH_RADIUS);
+
+  for (let i = 0; i < tries; i++) {
+    const r = clamp(base + i * Math.floor((MAX_SEARCH_RADIUS - base) / Math.max(1, tries - 1)), 8, MAX_SEARCH_RADIUS);
+    positions = findBlocksByNames(bot, valid, Math.min(count * 4, 80), r);
+    if (positions.length) break;
+    await yieldEvery(i, 1, 20);
+  }
+
   if (!positions.length) {
-    safeChat(bot, "No target blocks nearby.");
-    return 0;
+    // Signal failure so caller can inject exploration steps and retry.
+    throw new Error(`No target blocks nearby (targets=${valid.join(",")}, radius<=${MAX_SEARCH_RADIUS})`);
   }
 
   return await collectPositions(bot, positions, count);
@@ -225,25 +197,27 @@ async function farmHarvestReplant(
     const below = bot.blockAt(pos.offset(0, -1, 0));
     if (!below || below.name !== "farmland") continue;
 
-    const plantOrder = [];
-    for (const crop of cropBlocks) {
-      if (crop === "wheat") plantOrder.push("wheat_seeds");
-      if (crop === "carrots") plantOrder.push("carrot");
-      if (crop === "potatoes") plantOrder.push("potato");
-    }
+    const plantOptions = [
+      { block: "wheat", item: "wheat_seeds" },
+      { block: "carrots", item: "carrot" },
+      { block: "potatoes", item: "potato" },
+    ];
 
-    const item = plantOrder.map((n) => inv.find((i) => i.name === n)).find(Boolean);
-    if (!item) continue;
+    const opt = plantOptions.find((o) => cropBlocks.includes(o.block));
+    if (!opt) continue;
+
+    const seed = inv.find((it) => it.name === opt.item);
+    if (!seed) continue;
 
     try {
-      await bot.equip(item, "hand");
+      await bot.equip(seed, "hand");
       await bot.placeBlock(below, new Vec3(0, 1, 0));
-    } catch {}
-
-    await yieldEvery(++k, 8, 10);
+      await yieldEvery(++k, 6, 25);
+    } catch {
+      continue;
+    }
   }
 
-  if (harvested === 0) safeChat(bot, "Couldn't harvest crops.");
   return harvested;
 }
 

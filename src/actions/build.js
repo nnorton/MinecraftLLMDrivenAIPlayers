@@ -14,6 +14,7 @@ const GoalNear = goals.GoalNear;
 // Mineflayer expects Vec3 instances for positions passed to bot.blockAt() / placeBlock faces.
 // The vec3 package exports a factory function that returns a Vec3 with methods like .floored().
 const vec3 = require("vec3");
+const { getBuildSite, setBuildSite } = require("./memory");
 
 function clampInt(n, lo, hi, fallback) {
   const x = Number.isFinite(n) ? Math.floor(n) : fallback;
@@ -139,6 +140,45 @@ function findBuildOrigin(bot, size, maxRadius = 18) {
 }
 
 /**
+ * Validate that an origin is still buildable for a footprint of `size`.
+ * If the area is obstructed (trees, water, terrain changes), we recompute.
+ */
+function isOriginValid(bot, origin, size) {
+  if (!origin) return false;
+  const half = Math.floor(size / 2);
+  // require solid ground and 2 blocks of headroom across footprint
+  for (let fx = -half; fx <= half; fx++) {
+    for (let fz = -half; fz <= half; fz++) {
+      const ground = bot.blockAt(v(origin.x + fx, origin.y - 1, origin.z + fz));
+      const a1 = bot.blockAt(v(origin.x + fx, origin.y, origin.z + fz));
+      const a2 = bot.blockAt(v(origin.x + fx, origin.y + 1, origin.z + fz));
+      if (!isSolid(ground) || !isAir(a1) || !isAir(a2)) return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Resolve a fixed build site for a structure kind.
+ * - If a site is already stored in memory, use it (if still valid).
+ * - Otherwise, compute a site near the bot, store it, and use it consistently across retries and restarts.
+ */
+function resolveBuildOrigin(bot, siteKey, size) {
+  const key = String(siteKey || "FORT").toUpperCase();
+  const saved = getBuildSite(bot, key);
+  if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y) && Number.isFinite(saved.z)) {
+    const o = v(saved.x, saved.y, saved.z);
+    if (isOriginValid(bot, o, size)) return o;
+  }
+
+  const computed = findBuildOrigin(bot, size);
+  try {
+    setBuildSite(bot, key, { x: computed.x, y: computed.y, z: computed.z });
+  } catch {}
+  return computed;
+}
+
+/**
  * Movement helper: get within range of a target block position.
  */
 async function moveNear(bot, pos, range = 3) {
@@ -181,204 +221,131 @@ function findPlaceReference(bot, target) {
     if (isSolid(b)) return { ref: b, face: n.face };
   }
 
-  // Try above (rarely useful)
-  const above = bot.blockAt(v(target.x, target.y + 1, target.z));
-  if (isSolid(above)) return { ref: above, face: v(0, -1, 0) };
+  // As a last resort, try the block below-diagonal
+  const diag = bot.blockAt(v(target.x + 1, target.y - 1, target.z));
+  if (isSolid(diag)) return { ref: diag, face: v(-1, 1, 0) };
 
   return null;
 }
 
-async function placeOne(bot, target, material) {
-  const blockAtTarget = bot.blockAt(target);
-  if (!blockAtTarget) return { ok: false, reason: "no_blockAt" };
-  if (!isAir(blockAtTarget)) return { ok: true, skipped: true };
+async function placeOne(bot, pos) {
+  const existing = bot.blockAt(pos);
+  if (existing && !isAir(existing)) return false;
 
-  const ref = findPlaceReference(bot, target);
-  if (!ref) return { ok: false, reason: "no_reference_face" };
+  const ref = findPlaceReference(bot, pos);
+  if (!ref) return false;
 
-  // Move close so placeBlock succeeds
-  await moveNear(bot, target, 3);
-
-  // Ensure holding block
-  await equipBlock(bot, material);
-
-  try {
-    await bot.placeBlock(ref.ref, ref.face);
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, reason: String(e?.message || e) };
-  }
+  await moveNear(bot, pos, 3);
+  await bot.placeBlock(ref.ref, ref.face);
+  return true;
 }
 
-/**
- * Blueprint generators
- * Return array of placements: { pos:{x,y,z}, material?:string, tag?:string }
- * Positions are relative to origin (origin is center at floor level y).
- */
-
-// Fort: odd size (9/11/13). Walls height >=4. Corner towers height >=6.
-// Includes:
-// - perimeter walls
-// - gate opening on +Z side (2-wide)
-// - corner towers
-// - optional floor (1 layer) for recognizability
+// --- Blueprints ---
 function blueprintFort(size, wallH, towerH) {
   const half = Math.floor(size / 2);
-  const placements = [];
-  const floorY = 0; // origin y is floor level where bot stands (air). Ground is y-1.
+  const out = [];
 
-  // Floor (optional but makes it readable)
+  // floor
   for (let x = -half; x <= half; x++) {
-    for (let z = -half; z <= half; z++) {
-      placements.push({ pos: v(x, floorY, z), tag: "floor" });
-    }
+    for (let z = -half; z <= half; z++) out.push(v(x, 0, z));
   }
 
-  // Walls
+  // walls
   for (let y = 1; y <= wallH; y++) {
     for (let x = -half; x <= half; x++) {
-      // north/south
-      placements.push({ pos: v(x, y, -half), tag: "wall" });
-      placements.push({ pos: v(x, y, half), tag: "wall" });
+      out.push(v(x, y, -half));
+      out.push(v(x, y, half));
     }
     for (let z = -half; z <= half; z++) {
-      placements.push({ pos: v(-half, y, z), tag: "wall" });
-      placements.push({ pos: v(half, y, z), tag: "wall" });
+      out.push(v(-half, y, z));
+      out.push(v(half, y, z));
     }
   }
 
-  // Gate opening on +Z wall (2-wide, 2-high)
-  const gateX1 = -1;
-  const gateX2 = 0;
-  for (let y = 1; y <= 2; y++) {
-    // remove placements at these coords by filtering later
-    // We'll mark as "gate_void" and filter out.
-    placements.push({ pos: v(gateX1, y, half), tag: "gate_void" });
-    placements.push({ pos: v(gateX2, y, half), tag: "gate_void" });
-  }
-
-  // Towers (corners)
-  const corners = [v(-half, 1, -half), v(half, 1, -half), v(-half, 1, half), v(half, 1, half)];
+  // corner towers
+  const corners = [
+    v(-half, 1, -half),
+    v(-half, 1, half),
+    v(half, 1, -half),
+    v(half, 1, half),
+  ];
   for (const c of corners) {
-    for (let y = 1; y <= towerH; y++) {
-      // 2x2 tower footprint anchored at corner inward
-      const sx = c.x === -half ? -half : half - 1;
-      const sz = c.z === -half ? -half : half - 1;
-      placements.push({ pos: v(sx, y, sz), tag: "tower" });
-      placements.push({ pos: v(sx + 1, y, sz), tag: "tower" });
-      placements.push({ pos: v(sx, y, sz + 1), tag: "tower" });
-      placements.push({ pos: v(sx + 1, y, sz + 1), tag: "tower" });
-    }
+    for (let y = 1; y <= towerH; y++) out.push(v(c.x, y, c.z));
   }
 
-  // Battlements (simple crenellation)
-  const topY = wallH + 1;
+  // battlements
+  const battY = wallH + 1;
   for (let x = -half; x <= half; x += 2) {
-    placements.push({ pos: v(x, topY, -half), tag: "battlement" });
-    placements.push({ pos: v(x, topY, half), tag: "battlement" });
+    out.push(v(x, battY, -half));
+    out.push(v(x, battY, half));
   }
   for (let z = -half; z <= half; z += 2) {
-    placements.push({ pos: v(-half, topY, z), tag: "battlement" });
-    placements.push({ pos: v(half, topY, z), tag: "battlement" });
+    out.push(v(-half, battY, z));
+    out.push(v(half, battY, z));
   }
 
-  // Filter out gate voids from wall placements
-  const voidKeys = new Set(placements.filter((p) => p.tag === "gate_void").map((p) => keyOf(p.pos)));
-  const filtered = placements.filter((p) => p.tag !== "gate_void" && !voidKeys.has(keyOf(p.pos)));
-  return filtered;
+  // door gap (2 blocks high) on one side
+  // Remove door blocks from blueprint (front side z=-half)
+  const door = new Set([keyOf(v(0, 1, -half)), keyOf(v(0, 2, -half))]);
+  return out.filter((p) => !door.has(keyOf(p)));
 }
 
-// Obelisk: 3x3 base pedestal + tall 1x1 pillar with cap
 function blueprintObelisk(height) {
-  const placements = [];
-
-  // Pedestal 3x3 x 2 high
-  for (let y = 0; y <= 1; y++) {
-    for (let x = -1; x <= 1; x++) {
-      for (let z = -1; z <= 1; z++) {
-        placements.push({ pos: v(x, y, z), tag: "pedestal" });
-      }
-    }
-  }
-
-  // Pillar
-  for (let y = 2; y < height + 2; y++) {
-    placements.push({ pos: v(0, y, 0), tag: "pillar" });
-  }
-
-  // Cap (cross)
-  const capY = height + 2;
-  placements.push({ pos: v(0, capY, 0), tag: "cap" });
-  placements.push({ pos: v(1, capY, 0), tag: "cap" });
-  placements.push({ pos: v(-1, capY, 0), tag: "cap" });
-  placements.push({ pos: v(0, capY, 1), tag: "cap" });
-  placements.push({ pos: v(0, capY, -1), tag: "cap" });
-
-  return placements;
+  const out = [];
+  for (let y = 0; y < height; y++) out.push(v(0, y, 0));
+  // base ring for visibility
+  out.push(v(1, 0, 0));
+  out.push(v(-1, 0, 0));
+  out.push(v(0, 0, 1));
+  out.push(v(0, 0, -1));
+  return out;
 }
 
-/**
- * Build runner for any blueprint list.
- * - material: single material for all blocks (simple + recognizable)
- * - enforces min placed ratio, otherwise throws
- */
-async function runBlueprint(bot, origin, placements, material, opts = {}) {
-  const minComplete = Number.isFinite(opts.minComplete) ? opts.minComplete : 0.8;
+async function runBlueprint(bot, origin, blueprint, material, opts = {}) {
+  const minComplete = typeof opts.minComplete === "number" ? opts.minComplete : 0.8;
+  const minRequiredBlocks = typeof opts.minRequiredBlocks === "number" ? opts.minRequiredBlocks : 80;
 
-  // Place from bottom to top, for stability
-  const sorted = placements.slice().sort((a, b) => {
-    if (a.pos.y !== b.pos.y) return a.pos.y - b.pos.y;
-    if (a.pos.x !== b.pos.x) return a.pos.x - b.pos.x;
-    return a.pos.z - b.pos.z;
-  });
-
-  const totalNeeded = sorted.length;
-  const available = countItem(bot, material);
-  if (available < Math.min(totalNeeded, opts.minRequiredBlocks || 0)) {
-    throw new Error(`Insufficient ${material}: have ${available}, need at least ${opts.minRequiredBlocks || 0}`);
+  // Pre-check inventory (avoid "placing 2 blocks then claiming done")
+  const have = countItem(bot, material);
+  const need = blueprint.length;
+  const mustHave = Math.min(need, Math.max(minRequiredBlocks, Math.floor(need * 0.6)));
+  if (have < mustHave) {
+    throw new Error(`Insufficient ${material}: have ${have}, need at least ${mustHave}`);
   }
 
-  let ok = 0;
-  let skipped = 0;
-  let failed = 0;
+  await equipBlock(bot, material);
 
-  // Walk to origin first (helps reduce scattered placements)
-  await moveNear(bot, origin, 3);
+  let placed = 0;
+  const total = blueprint.length;
 
-  for (const p of sorted) {
-    const abs = add(origin, p.pos);
-    const res = await placeOne(bot, abs, material);
-    if (res.ok) {
-      if (res.skipped) skipped++;
-      else ok++;
-    } else {
-      failed++;
-      // If too many consecutive failures, bail early so planner can recover.
-      if (failed >= 15) break;
-      // Small delay to let pathfinder settle
-      await new Promise((r) => setTimeout(r, 120));
+  // Place blocks in a stable order: low->high, near->far
+  const sorted = blueprint
+    .slice()
+    .sort((a, b) => (a.y - b.y) || (Math.abs(a.x) + Math.abs(a.z) - (Math.abs(b.x) + Math.abs(b.z))));
+
+  for (let i = 0; i < sorted.length; i++) {
+    const rel = sorted[i];
+    const target = add(origin, rel);
+
+    try {
+      const ok = await placeOne(bot, target);
+      if (ok) placed++;
+    } catch {
+      // ignore individual failures; we'll validate completion ratio at end
     }
+
+    // small yield
+    if (i % 18 === 0) await new Promise((r) => setTimeout(r, 25));
   }
 
-  // Validate by checking world blocks at expected coordinates
-  let present = 0;
-  for (const p of sorted) {
-    const abs = add(origin, p.pos);
-    const b = bot.blockAt(abs);
-    if (b && b.name === material) present++;
+  const ratio = total > 0 ? placed / total : 0;
+  if (placed < minRequiredBlocks || ratio < minComplete) {
+    throw new Error(`Build incomplete: completion ${Math.round(ratio * 100)}% (placed=${placed}/${total})`);
   }
 
-  const completion = present / Math.max(1, totalNeeded);
-  if (completion < minComplete) {
-    throw new Error(
-      `Build incomplete: completion ${(completion * 100).toFixed(0)}% (placed=${present}/${totalNeeded}, ok=${ok}, skipped=${skipped}, failed=${failed})`
-    );
-  }
-
-  return { ok, skipped, failed, present, total: totalNeeded, completion };
+  return { placed, total, ratio };
 }
 
-/** Public build APIs used by bot.js */
 async function buildFort(bot, params = {}) {
   // Enforce recognizable minimums
   const size = clampInt(params.size, 9, 13, 9);
@@ -392,7 +359,11 @@ async function buildFort(bot, params = {}) {
     chooseMaterialFromInventory(bot, ["cobblestone", "stone_bricks", "deepslate", "cobbled_deepslate", "stone", "oak_planks"]);
   if (!material) throw new Error("No placeable material found for fort");
 
-  const origin = findBuildOrigin(bot, size);
+  // ✅ Fixed site:
+  // - if params.origin provided, use it
+  // - else reuse stored "FORT" site from memory (or compute+store once)
+  const origin = params.origin ? v(params.origin.x, params.origin.y, params.origin.z) : resolveBuildOrigin(bot, "FORT", size);
+
   const blueprint = blueprintFort(size, wallH, towerH);
 
   // Rough min blocks: ensure it can't "finish" tiny
@@ -410,14 +381,16 @@ async function buildMonument(bot, params = {}) {
     requested || chooseMaterialFromInventory(bot, ["stone_bricks", "smooth_stone", "quartz_block", "cobblestone", "stone", "oak_planks"]);
   if (!material) throw new Error("No placeable material found for monument");
 
-  const origin = findBuildOrigin(bot, 7); // small footprint scan
+  // ✅ Fixed site for monuments too (separate key from fort)
+  const origin = params.origin ? v(params.origin.x, params.origin.y, params.origin.z) : resolveBuildOrigin(bot, "MONUMENT", 7); // fixed footprint site
+
   const blueprint = blueprintObelisk(height);
-  const minRequiredBlocks = Math.max(30, Math.floor(blueprint.length * 0.8));
+  const minRequiredBlocks = Math.max(40, Math.floor(blueprint.length * 0.7));
   return runBlueprint(bot, origin, blueprint, material, { minComplete: 0.85, minRequiredBlocks });
 }
 
-async function buildMonumentComplex(bot, kind = "OBELISK", params = {}) {
-  // For now, OBELISK is the “complex” option; can add ARCH/SPIRAL_TOWER/SHRINE later.
+async function buildMonumentComplex(bot, kind, params = {}) {
+  // For now, only OBELISK is implemented with complex wrapper; can add more kinds later.
   const k = String(kind || "OBELISK").toUpperCase();
   if (k !== "OBELISK") {
     // Fall back to obelisk with slightly larger default
