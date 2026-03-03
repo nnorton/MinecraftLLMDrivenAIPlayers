@@ -23,32 +23,41 @@ const gather = require("./actions/gather");
 const AUTONOMY_INTERVAL_MS = 5 * 60 * 1000;
 const TASK_TICK_MS = 1500;
 const COOLDOWN_ON_HUMAN_MS = 1500;
-
-// ---- LLM rate limiting (per bot) ----
-// Prevents bots from calling OpenAI too frequently between steps/failures.
-const LLM_MIN_INTERVAL_MINUTES = parseFloat(process.env.LLM_MIN_INTERVAL_MINUTES || "2");
-const LLM_MIN_INTERVAL_MS = Math.max(0, LLM_MIN_INTERVAL_MINUTES) * 60 * 1000;
-
 const WANDER_RADIUS = 30;
 
 // ✅ Memory reducer: Mineflayer chunk radius per bot
 // Suggested: 2-4. Default here is 3.
 const BOT_VIEW_DISTANCE = parseInt(process.env.BOT_VIEW_DISTANCE || "3", 10);
 
+// ---- LLM on/off switch ----
+// Set LLM_ENABLED=false in .env to completely disable OpenAI usage.
+// When disabled, bots will only use deterministic/non-LLM task logic.
+function parseBool(v, defVal = true) {
+  if (v === undefined || v === null || v === "") return defVal;
+  const s = String(v).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "no", "n", "off"].includes(s)) return false;
+  return defVal;
+}
+const LLM_ENABLED = parseBool(process.env.LLM_ENABLED, true);
+
 // ---- Pathfinder tuning ----
-// mineflayer-pathfinder can throw: "Took to long to decide path to goal!" when path planning exceeds thinkTimeout.
-// We set a slightly higher thinkTimeout and add retry logic with a small nudge.
-const PATHFINDER_THINK_TIMEOUT_MS = parseInt(process.env.PATHFINDER_THINK_TIMEOUT_MS || "10000", 10);
-const PATHFINDER_ERROR_RETRY_LIMIT = parseInt(process.env.PATHFINDER_ERROR_RETRY_LIMIT || "2", 10);
+const PATHFINDER_THINK_TIMEOUT_MS = parseInt(
+  process.env.PATHFINDER_THINK_TIMEOUT_MS || "10000",
+  10
+);
+const PATHFINDER_ERROR_RETRY_LIMIT = parseInt(
+  process.env.PATHFINDER_ERROR_RETRY_LIMIT || "2",
+  10
+);
 
 // ---- Plan commitment (reduce mid-task plan switching) ----
-// While a "major" step is running, we queue incoming human requests and apply them when we reach a safe boundary.
 const PLAN_COMMIT_MS = parseInt(process.env.PLAN_COMMIT_MS || "60000", 10);
 
 // ---- “Always busy” controls ----
 const WANDER_MAX_MS = parseInt(process.env.WANDER_MAX_MS || "45000", 10);
 const STEP_TIMEOUT_MS = parseInt(process.env.STEP_TIMEOUT_MS || "180000", 10);
-const STUCK_NO_MOVE_MS = parseInt(process.env.STUCK_NO_MOVE_MS || "35000", 10); // a bit more tolerant by default
+const STUCK_NO_MOVE_MS = parseInt(process.env.STUCK_NO_MOVE_MS || "35000", 10);
 
 // ---- Extra unstuck tuning ----
 const UNSTUCK_COOLDOWN_MS = parseInt(process.env.UNSTUCK_COOLDOWN_MS || "90000", 10);
@@ -59,7 +68,6 @@ const UNSTUCK_STAGE1_MS = parseInt(process.env.UNSTUCK_STAGE1_MS || "9000", 10);
 const TEAM_PREFIX = "[TEAM]";
 const TEAM_EVENT_RATE_MS = 2500;
 
-// ---- Bot utils ----
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -85,7 +93,6 @@ function isPathfinderPlanningError(msg) {
 }
 
 function isMajorStepType(type) {
-  // Steps that are expected to take time and should not be interrupted by re-planning.
   return (
     type === "GATHER_WOOD" ||
     type === "MINE_BLOCKS" ||
@@ -106,10 +113,11 @@ function invCount(bot, itemName) {
   return total;
 }
 
-// Parse errors like: "Insufficient cobblestone: have 186, need at least 202"
 function parseInsufficientMaterial(errMsg) {
   const msg = String(errMsg || "");
-  const m = msg.match(/Insufficient\s+([a-z0-9_]+):\s*have\s*(\d+),\s*need\s*at\s*least\s*(\d+)/i);
+  const m = msg.match(
+    /Insufficient\s+([a-z0-9_]+):\s*have\s*(\d+),\s*need\s*at\s*least\s*(\d+)/i
+  );
   if (!m) return null;
   return {
     material: m[1].toLowerCase(),
@@ -120,7 +128,9 @@ function parseInsufficientMaterial(errMsg) {
 
 function parseBuildIncomplete(errMsg) {
   const msg = String(errMsg || "");
-  const m = msg.match(/Build\s+incomplete:\s*completion\s*(\d+)%\s*\(placed=(\d+)\/(\d+)/i);
+  const m = msg.match(
+    /Build\s+incomplete:\s*completion\s*(\d+)%\s*\(placed=(\d+)\/(\d+)/i
+  );
   if (!m) return null;
   return {
     completionPct: parseInt(m[1], 10) || 0,
@@ -129,114 +139,85 @@ function parseBuildIncomplete(errMsg) {
   };
 }
 
-function estimateFortBlocks(size = 9, height = 4) {
-  // Rough underestimate is fine; builder has its own strict check.
-  const s = Math.max(5, Math.min(13, parseInt(size, 10) || 9));
-  const h = Math.max(3, Math.min(8, parseInt(height, 10) || 4));
-  const floor = s * s;
-  const walls = 4 * s * h;
-  // Towers + battlements can add a lot; include a buffer.
-  return floor + walls + Math.ceil(0.35 * (floor + walls));
-}
-
-function setActiveGoalFromStep(bot, step) {
-  const type = normalizeType(step?.type);
-  if (type === "BUILD_STRUCTURE" && String(step?.kind || "").toUpperCase() === "FORT") {
-    bot._activeGoal = {
-      kind: "FORT",
-      params: {
-        size: step.size ?? 9,
-        height: step.height ?? 4,
-        material: step.material || "cobblestone",
-      },
-      startedAt: Date.now(),
-      lastAttemptAt: 0,
-      done: false,
-      retries: 0,
-    };
-  }
-}
-
 function mineTargetForMaterial(material) {
-  // When you mine "stone" blocks you get "cobblestone" items.
   if (material === "cobblestone") return "stone";
-  // Planks come from logs; let gatherWood handle it.
   if (material.endsWith("_planks")) return null;
-  // Default fallback: try to mine the material block itself (if it exists).
   return material;
 }
 
-function continuationPlanForGoal(bot) {
-  const g = bot._activeGoal;
-  if (!g || g.done) return null;
+function deterministicPlan(bot, humanMessage) {
+  const msg = String(humanMessage || "").toLowerCase();
 
-  if (g.kind === "FORT") {
-    const size = g.params.size ?? 9;
-    const height = g.params.height ?? 4;
-    const material = g.params.material || "cobblestone";
-    const needed = estimateFortBlocks(size, height);
-    const have = invCount(bot, material);
-    const deficit = Math.max(0, needed - have);
-
-    // If we're short, mine stone (for cobblestone) and keep going.
-    if (deficit > 0) {
-      const mineCount = Math.max(16, Math.min(64, deficit + 24));
-      return [
-        {
-          type: "SAY",
-          text: `Preparing to build the fort: need ~${needed} ${material}, have ${have}. Mining more…`,
-        },
-        { type: "MINE_BLOCKS", targets: [mineTargetForMaterial(material) || "stone", "coal_ore"], count: mineCount, radius: 48 },
-        { type: "BUILD_STRUCTURE", kind: "FORT", size, height, material },
-      ];
-    }
-
+  if (
+    msg.includes("fort") ||
+    msg.includes("wall") ||
+    msg.includes("defense") ||
+    msg.includes("castle")
+  ) {
     return [
-      { type: "SAY", text: "Continuing fort construction until it’s clearly complete." },
-      { type: "BUILD_STRUCTURE", kind: "FORT", size, height, material },
+      { type: "SAY", text: "Understood — I’ll build a proper fort and keep working until it’s done." },
+      { type: "CRAFT_TOOLS" },
+      { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 32, radius: 48 },
+      { type: "BUILD_STRUCTURE", kind: "FORT", size: 9, height: 4, material: "cobblestone" },
     ];
   }
 
-  return null;
+  if (msg.includes("monument") || msg.includes("obelisk") || msg.includes("statue")) {
+    return [
+      { type: "SAY", text: "Got it — I’ll build a recognizable monument." },
+      { type: "CRAFT_TOOLS" },
+      { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 24, radius: 48 },
+      { type: "BUILD_MONUMENT", height: 11, material: "stone_bricks" },
+    ];
+  }
+
+  if (msg.includes("wood") || msg.includes("logs")) {
+    return [
+      { type: "SAY", text: "On it — gathering wood." },
+      { type: "GATHER_WOOD", count: 12 },
+    ];
+  }
+
+  if (msg.includes("iron") || msg.includes("coal") || msg.includes("mine")) {
+    return [
+      { type: "SAY", text: "On it — mining useful resources." },
+      { type: "MINE_BLOCKS", targets: ["coal_ore", "iron_ore", "stone"], count: 18, radius: 64 },
+      { type: "SMELT_ORE" },
+    ];
+  }
+
+  const picked = pickNextTask(bot);
+  if (picked) return [picked];
+  return [{ type: "WANDER", radius: 24, maxMs: 20000 }];
 }
 
 function remediateInsufficientMaterial({ bot, step, parsed }) {
   const { material, have, need } = parsed;
   const deficit = Math.max(0, need - have);
 
-  // Guard against infinite loops: only retry a given step a couple times
   step._resourceRetries = (step._resourceRetries || 0) + 1;
   if (step._resourceRetries > 2) {
     return {
       ok: false,
       reason: `resource_retry_exhausted:${material}`,
       newQueue: [
-        {
-          type: "SAY",
-          text: `I keep coming up short on ${material}. I’ll switch to other useful work for now.`,
-        },
+        { type: "SAY", text: `I keep coming up short on ${material}. Switching to other useful work for now.` },
         { type: "MINE_BLOCKS", targets: ["coal_ore", "iron_ore", "stone"], count: 12, radius: 48 },
         { type: "SMELT_ORE" },
       ],
     };
   }
 
-  // Mine/craft enough extra, with buffer so we don't thrash.
   const buffer = 24;
   const wantExtra = Math.max(16, Math.min(96, deficit + buffer));
-
   const mineTarget = mineTargetForMaterial(material);
 
-  // If the required material is planks, do a wood+craft loop.
   if (material.endsWith("_planks")) {
     return {
       ok: true,
       reason: `gather_wood_for_${material}`,
       newQueue: [
-        {
-          type: "SAY",
-          text: `I’m short on ${material}. I’ll gather some wood and craft planks, then continue.`,
-        },
+        { type: "SAY", text: `I’m short on ${material}. I’ll gather wood and craft planks, then continue.` },
         { type: "GATHER_WOOD", count: Math.max(6, Math.ceil(wantExtra / 4)) },
         { type: "CRAFT_TOOLS" },
         step,
@@ -274,9 +255,8 @@ function posObj(bot) {
 }
 
 async function createAgent(opts) {
-  const { host, port, persona, username, allBotNames } = opts;
+  const { host, port, persona, username } = opts;
 
-  // ✅ Apply viewDistance here
   const bot = mineflayer.createBot({
     host,
     port,
@@ -294,24 +274,9 @@ async function createAgent(opts) {
   bot._planning = false;
   bot._lastAutonomyAt = 0;
   bot._lastHumanAt = 0;
-  bot._lastTeamEventAt = 0;
-  bot._lastDmAt = 0;
-
-  // LLM call timestamp (for rate limiting)
-  bot._lastLlmAt = 0;
-
-  // Long-running goal state (helps complete tasks like "build a fort" without constant replanning)
-  bot._activeGoal = null; // { kind, params, startedAt, lastAttemptAt, done, retries }
-
-  // Plan switching guard
   bot._commitUntil = 0;
-  bot._pendingHuman = null; // { from, text, ts }
+  bot._pendingHuman = null;
 
-  // team intel dirty flag
-  bot._teamDirty = false;
-  bot._teamDirtyAt = 0;
-
-  // Watchdog state
   bot._lastPos = null;
   bot._lastMoveAt = Date.now();
   bot._wanderStartedAt = 0;
@@ -320,7 +285,6 @@ async function createAgent(opts) {
   bot._lastGoalChangeAt = 0;
   bot._unstuckStage1At = 0;
 
-  // Chat throttle
   bot._lastChatAt = 0;
 
   function safeChat(msg) {
@@ -341,9 +305,7 @@ async function createAgent(opts) {
     reconnectAttempts++;
 
     const delay = clamp(1000 * reconnectAttempts, 2500, 20000);
-    console.warn(
-      `[${username}] reconnecting in ${Math.round(delay / 1000)}s (reason=${reason})`
-    );
+    console.warn(`[${username}] reconnecting in ${Math.round(delay / 1000)}s (reason=${reason})`);
 
     setTimeout(() => {
       try {
@@ -364,57 +326,32 @@ async function createAgent(opts) {
     const now = Date.now();
     const hasWork = bot._planQueue.length > 0;
 
-    // If we have an active long-running goal (e.g., fort), keep progressing with deterministic logic
-    // instead of replanning / calling the LLM between partial attempts.
-    if (!hasWork && bot._activeGoal && !bot._activeGoal.done) {
-      const cont = continuationPlanForGoal(bot);
-      if (Array.isArray(cont) && cont.length) {
-        bot._planQueue = cont;
-      }
-    }
-
-    // If no work, plan
-    if (!bot._planQueue.length) {
-      // If a human message arrived while we were committed to a long task, handle it now.
+    if (!hasWork) {
       if (bot._pendingHuman && !bot._planning) {
         const pending = bot._pendingHuman;
         bot._pendingHuman = null;
         bot._lastHumanAt = Date.now();
         bot._planning = true;
+
         const personaPrompt = persona?.systemPrompt || "";
 
-        // Per-bot LLM rate limit: if too soon, handle the human request with non-LLM continuation this tick.
-        if (LLM_MIN_INTERVAL_MS > 0 && now - (bot._lastLlmAt || 0) < LLM_MIN_INTERVAL_MS) {
-          const cont = continuationPlanForGoal(bot);
-          bot._planQueue = cont && cont.length ? cont : (pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }]);
-          bot._planning = false;
-          ensureWork();
-          return;
-        }
-        bot._lastLlmAt = now;
+        const planPromise = LLM_ENABLED
+          ? planActions({
+              systemPrompt: personaPrompt,
+              bot,
+              humanMessage: pending.text,
+              trigger: "human_deferred",
+            })
+          : Promise.resolve({ say: "", plan: deterministicPlan(bot, pending.text) });
 
-        planActions({
-          systemPrompt: personaPrompt,
-          bot,
-          humanMessage: pending.text,
-          trigger: "human_deferred",
-        })
+        planPromise
           .then((res) => {
             if (res?.say) safeChat(res.say);
-            if (Array.isArray(res?.plan)) {
-              bot._planQueue = res.plan;
-              try {
-                setActiveGoalFromStep(
-                  bot,
-                  res.plan.find((s) => isMajorStepType(normalizeType(s?.type))) || res.plan[0]
-                );
-              } catch {}
-            }
+            if (Array.isArray(res?.plan)) bot._planQueue = res.plan;
           })
           .catch((e) => {
             console.error(`[${bot.username}] deferred planning failed`, e?.message || e);
-            const picked = pickNextTask(bot);
-            bot._planQueue = picked ? [picked] : [{ type: "WANDER" }];
+            bot._planQueue = deterministicPlan(bot, pending.text);
           })
           .finally(() => {
             bot._planning = false;
@@ -423,7 +360,6 @@ async function createAgent(opts) {
         return;
       }
 
-      // Autonomy planning or human prompt
       if (now - bot._lastHumanAt < COOLDOWN_ON_HUMAN_MS) return;
 
       if (now - bot._lastAutonomyAt > AUTONOMY_INTERVAL_MS) {
@@ -432,34 +368,21 @@ async function createAgent(opts) {
 
         const personaPrompt = persona?.systemPrompt || "";
 
-        // Per-bot LLM rate limit: if too soon, do useful deterministic work instead of calling the LLM.
-        if (LLM_MIN_INTERVAL_MS > 0 && now - (bot._lastLlmAt || 0) < LLM_MIN_INTERVAL_MS) {
-          const cont = continuationPlanForGoal(bot);
-          bot._planQueue = cont && cont.length ? cont : (pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }]);
-          bot._planning = false;
-          ensureWork();
-          return;
-        }
-        bot._lastLlmAt = now;
+        const planPromise = LLM_ENABLED
+          ? planActions({ systemPrompt: personaPrompt, bot, humanMessage: null, trigger: "autonomy" })
+          : Promise.resolve({
+              say: "",
+              plan: pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }],
+            });
 
-        planActions({ systemPrompt: personaPrompt, bot, humanMessage: null, trigger: "autonomy" })
+        planPromise
           .then((res) => {
             if (res?.say) safeChat(res.say);
-            if (Array.isArray(res?.plan)) {
-              bot._planQueue = res.plan;
-              try {
-                setActiveGoalFromStep(
-                  bot,
-                  res.plan.find((s) => isMajorStepType(normalizeType(s?.type))) || res.plan[0]
-                );
-              } catch {}
-            }
+            if (Array.isArray(res?.plan)) bot._planQueue = res.plan;
           })
           .catch((e) => {
             console.error(`[${bot.username}] planning failed`, e?.message || e);
-            // hard fallback
-            const picked = pickNextTask(bot);
-            bot._planQueue = picked ? [picked] : [{ type: "WANDER" }];
+            bot._planQueue = pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }];
           })
           .finally(() => {
             bot._planning = false;
@@ -468,10 +391,7 @@ async function createAgent(opts) {
         return;
       }
 
-      // If in between autonomy windows, do something small
-      const picked = pickNextTask(bot);
-      if (picked) bot._planQueue = [picked];
-      else bot._planQueue = [{ type: "WANDER" }];
+      bot._planQueue = pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }];
     }
 
     executeNextStep().catch(() => {});
@@ -488,55 +408,37 @@ async function createAgent(opts) {
 
     const type = normalizeType(step?.type);
 
-    // If we're about to run a long/important step, "commit" for a bit so we don't constantly
-    // switch plans due to new LLM outputs or incidental chat.
     if (isMajorStepType(type)) {
       bot._commitUntil = Math.max(bot._commitUntil || 0, Date.now() + PLAN_COMMIT_MS);
     }
+
     const stepPos = posObj(bot);
 
     try {
       if (!type) {
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "SAY") {
         if (step.text) safeChat(step.text);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "PAUSE") {
         await sleep(parseInt(step.ms, 10) || 250);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "RESET_PATHFINDER") {
-        try {
-          bot.pathfinder.setGoal(null);
-        } catch {}
-        try {
-          bot.clearControlStates();
-        } catch {}
+        try { bot.pathfinder.setGoal(null); } catch {}
+        try { bot.clearControlStates(); } catch {}
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "SET_BASE") {
         const p = posObj(bot);
         if (p) setBase(bot, p);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "WANDER") {
         const r = parseInt(step.radius, 10) || WANDER_RADIUS;
         const maxMs = parseInt(step.maxMs, 10) || WANDER_MAX_MS;
         wander(bot, r, maxMs);
-        bot._stepStartedAt = 0;
       } else if (type === "FOLLOW") {
         follow(bot, step.player);
-        bot._stepStartedAt = 0;
       } else if (type === "GOTO") {
         goto(bot, step.x, step.y, step.z);
-        bot._stepStartedAt = 0;
       } else if (type === "RETURN_BASE") {
         const b = getBase(bot);
         if (!b) {
@@ -545,12 +447,9 @@ async function createAgent(opts) {
         } else {
           goto(bot, b.x, b.y, b.z);
         }
-        bot._stepStartedAt = 0;
       } else if (type === "GATHER_WOOD") {
         await gather.gatherWood(bot, step.count ?? 8);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "MINE_BLOCKS") {
         await gather.mineTargets(
           bot,
@@ -559,56 +458,31 @@ async function createAgent(opts) {
           step.radius ?? undefined
         );
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "FARM_HARVEST_REPLANT") {
         await gather.farmHarvestReplant(bot, step.crops ?? ["wheat", "carrots", "potatoes"], step.max ?? 12);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "BUILD_STRUCTURE") {
-        // ✅ NEW: Pass parameters through so builder can size/choose materials.
         await buildFort(bot, step);
-        // If this was a fort build, consider the goal completed once the builder returns successfully.
-        if (bot._activeGoal && bot._activeGoal.kind === "FORT") {
-          bot._activeGoal.done = true;
-        }
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "BUILD_MONUMENT") {
         await buildMonument(bot, step);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "BUILD_MONUMENT_COMPLEX") {
         await buildMonumentComplex(bot, step.kind || "OBELISK", step);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "CRAFT_TOOLS") {
         await craftTools(bot);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "SMELT_ORE") {
         await smeltOre(bot);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else if (type === "FIGHT_MOBS") {
         await fightMobs(bot, step.seconds ?? 20);
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       } else {
-        // Unknown step: drop it
         bot._planQueue.shift();
-        bot._current = null;
-        bot._stepStartedAt = 0;
       }
 
-      // Light telemetry for important actions
       if (
         type !== "SAY" &&
         type !== "WANDER" &&
@@ -627,131 +501,65 @@ async function createAgent(opts) {
       const reason = shortErr(e);
       console.error(`[${bot.username}] step failed`, e?.message || e);
 
-      // Recovery: if a build (or other action) fails due to missing/insufficient materials,
-      // inject prerequisite gathering/mining steps and retry a limited number of times.
       const parsed = parseInsufficientMaterial(reason);
       if (parsed && bot._current) {
         const remediation = remediateInsufficientMaterial({ bot, step: bot._current, parsed });
         if (remediation?.ok && Array.isArray(remediation.newQueue) && remediation.newQueue.length) {
-          postEvent(
-            bot.username,
-            `${TEAM_PREFIX} recover ${type}: ${remediation.reason}`,
-            "action_recover",
-            {
-              type,
-              reason: remediation.reason,
-              err: reason,
-              ms: Date.now() - startedAt,
-              pos: stepPos,
-              pos2: posObj(bot),
-            }
-          );
-
-          // Replace the current step with a small recovery plan so we don't thrash on the same failure.
+          postEvent(bot.username, `${TEAM_PREFIX} recover ${type}: ${remediation.reason}`, "action_recover", {
+            type,
+            reason: remediation.reason,
+            err: reason,
+            ms: Date.now() - startedAt,
+            pos: stepPos,
+            pos2: posObj(bot),
+          });
           bot._planQueue = [...remediation.newQueue, ...bot._planQueue.slice(1)];
           bot._current = null;
-          bot._stepStartedAt = 0;
-
-          // Best-effort chat (throttled by safeChat)
-          try {
-            const firstSay = remediation.newQueue.find((s) => normalizeType(s?.type) === "SAY");
-            if (firstSay?.text) safeChat(firstSay.text);
-          } catch {}
           return;
         }
       }
 
-      // Recovery: if the builder reports incomplete progress, keep trying the same build step
-      // (usually means we placed many blocks but haven't hit the completion threshold yet).
       const incomplete = parseBuildIncomplete(reason);
       if (incomplete && bot._current && normalizeType(bot._current.type) === "BUILD_STRUCTURE") {
         bot._current._buildRetries = (bot._current._buildRetries || 0) + 1;
         const tries = bot._current._buildRetries;
-
         if (tries <= 6) {
-          postEvent(
-            bot.username,
-            `${TEAM_PREFIX} recover ${type}: build_incomplete_${tries}`,
-            "action_recover",
-            {
-              type,
-              reason: `build_incomplete_${tries}`,
-              err: reason,
-              ms: Date.now() - startedAt,
-              pos: stepPos,
-              pos2: posObj(bot),
-              completionPct: incomplete.completionPct,
-              placed: incomplete.placed,
-              total: incomplete.total,
-            }
-          );
-
-          bot._planQueue = [{ type: "PAUSE", ms: 250 }, { type: "WANDER", radius: 4, maxMs: 3500 }, bot._current, ...bot._planQueue.slice(1)];
-          bot._current = null;
-          bot._stepStartedAt = 0;
-          return;
-        }
-      }
-
-      // Recovery: if mining can't find target blocks nearby, explore a bit and retry.
-      if (/No target blocks nearby/i.test(reason) && bot._current && normalizeType(bot._current.type) === "MINE_BLOCKS") {
-        bot._current._searchRetries = (bot._current._searchRetries || 0) + 1;
-        const tries = bot._current._searchRetries;
-
-        if (tries <= 5) {
-          postEvent(
-            bot.username,
-            `${TEAM_PREFIX} recover ${type}: expand_search_${tries}`,
-            "action_recover",
-            {
-              type,
-              reason: `expand_search_${tries}`,
-              err: reason,
-              ms: Date.now() - startedAt,
-              pos: stepPos,
-              pos2: posObj(bot),
-            }
-          );
-
-          // Increase search radius progressively.
-          const nextRadius = Math.min(96, Math.max(32, (bot._current.radius || 32) + 16));
-          bot._current.radius = nextRadius;
-
+          postEvent(bot.username, `${TEAM_PREFIX} recover ${type}: build_incomplete_${tries}`, "action_recover", {
+            type,
+            reason: `build_incomplete_${tries}`,
+            err: reason,
+            ms: Date.now() - startedAt,
+            pos: stepPos,
+            pos2: posObj(bot),
+            completionPct: incomplete.completionPct,
+            placed: incomplete.placed,
+            total: incomplete.total,
+          });
           bot._planQueue = [
-            { type: "RESET_PATHFINDER" },
             { type: "PAUSE", ms: 250 },
-            { type: "WANDER", radius: 14, maxMs: 14000 },
+            { type: "WANDER", radius: 4, maxMs: 3500 },
             bot._current,
             ...bot._planQueue.slice(1),
           ];
           bot._current = null;
-          bot._stepStartedAt = 0;
           return;
         }
       }
 
-      // Recovery: if we hit pathfinder planning timeouts, don't immediately abandon the step.
-      // Insert a small nudge (reset pathfinder + short wander) and retry the same step a couple times.
       if (isPathfinderPlanningError(reason) && bot._current) {
         bot._current._pathRetries = (bot._current._pathRetries || 0) + 1;
         const tries = bot._current._pathRetries;
 
         if (tries <= PATHFINDER_ERROR_RETRY_LIMIT) {
-          postEvent(
-            bot.username,
-            `${TEAM_PREFIX} recover ${type}: pathfinder_retry_${tries}`,
-            "action_recover",
-            {
-              type,
-              reason: `pathfinder_retry_${tries}`,
-              err: reason,
-              ms: Date.now() - startedAt,
-              pos: stepPos,
-              pos2: posObj(bot),
-            }
-          );
+          postEvent(bot.username, `${TEAM_PREFIX} recover ${type}: pathfinder_retry_${tries}`, "action_recover", {
+            type,
+            reason: `pathfinder_retry_${tries}`,
+            err: reason,
+            ms: Date.now() - startedAt,
+            pos: stepPos,
+            pos2: posObj(bot),
+          });
 
-          // Replace current step with a short reset + wander nudge, then retry the original step.
           bot._planQueue = [
             { type: "RESET_PATHFINDER" },
             { type: "PAUSE", ms: 250 },
@@ -759,9 +567,7 @@ async function createAgent(opts) {
             bot._current,
             ...bot._planQueue.slice(1),
           ];
-
           bot._current = null;
-          bot._stepStartedAt = 0;
           return;
         }
       }
@@ -775,14 +581,12 @@ async function createAgent(opts) {
       });
       bot._planQueue.shift();
       bot._current = null;
-      bot._stepStartedAt = 0;
     } finally {
       bot._executing = false;
       ensureWork();
     }
   }
 
-  // ---- Lifecycle + watchdog wiring ----
   bot.once("spawn", () => {
     reconnectAttempts = 0;
     reconnectScheduled = false;
@@ -791,12 +595,10 @@ async function createAgent(opts) {
     const movements = new Movements(bot, mcData);
     bot.pathfinder.setMovements(movements);
 
-    // Pathfinder tuning
     try {
       bot.pathfinder.thinkTimeout = PATHFINDER_THINK_TIMEOUT_MS;
     } catch {}
 
-    // Kick work loop
     ensureWork();
   });
 
@@ -804,20 +606,14 @@ async function createAgent(opts) {
     if (!username2 || username2 === bot.username) return;
     if (!message) return;
 
-    // Team prefixed broadcasts -> record + mark dirty
     if (message.startsWith(TEAM_PREFIX)) {
       postEvent(username2, message, "chat", {});
-      bot._teamDirty = true;
-      bot._teamDirtyAt = Date.now();
       return;
     }
 
-    // Direct user message
     bot._lastHumanAt = Date.now();
     pushMessage(bot.username, { from: username2, text: message, ts: Date.now() });
 
-    // If we're in the middle of a committed long task, don't wipe the current queue.
-    // Queue the message and apply it when we reach a safe boundary (queue empty / idle).
     const now = Date.now();
     const hasWork = bot._planQueue.length > 0;
     const committed = hasWork && now < (bot._commitUntil || 0);
@@ -828,13 +624,11 @@ async function createAgent(opts) {
       return;
     }
 
-    // Otherwise, plan immediately by clearing current queue (safe boundary)
     bot._pendingHuman = { from: username2, text: message, ts: now };
     bot._planQueue = [];
     ensureWork();
   });
 
-  // ---- Work tick ----
   const workInterval = setInterval(() => {
     try {
       tickMovement(bot);

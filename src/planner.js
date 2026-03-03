@@ -9,19 +9,17 @@ const { pickNextTask } = require("./task_picker");
 const MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 const MAX_OUTPUT_TOKENS = parseInt(process.env.OPENAI_MAX_OUTPUT_TOKENS || "1000", 10);
 
-const LLM_MIN_INTERVAL_MINUTES = parseFloat(process.env.LLM_MIN_INTERVAL_MINUTES || "2");
-const LLM_MIN_INTERVAL_MS = Math.max(0, LLM_MIN_INTERVAL_MINUTES) * 60 * 1000;
-
-// Per-bot LLM call timestamps to enforce "no more than once every N minutes"
-const _lastLlmCallAtByBot = new Map();
-function canCallLLM(botUsername) {
-  const now = Date.now();
-  const last = _lastLlmCallAtByBot.get(botUsername) || 0;
-  return now - last >= LLM_MIN_INTERVAL_MS;
+// LLM on/off switch
+// Set LLM_ENABLED=false in .env to completely disable OpenAI usage.
+// When disabled, this module will NEVER call the OpenAI API and will return deterministic plans.
+function parseBool(v, defVal = true) {
+  if (v === undefined || v === null || v === "") return defVal;
+  const s = String(v).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "no", "n", "off"].includes(s)) return false;
+  return defVal;
 }
-function markLLMCalled(botUsername) {
-  _lastLlmCallAtByBot.set(botUsername, Date.now());
-}
+const LLM_ENABLED = parseBool(process.env.LLM_ENABLED, true);
 
 let _client = null;
 async function getClient() {
@@ -85,20 +83,25 @@ function ensurePlanNonEmpty(bot, plan) {
 function chooseHelpfulPlanNonLLM({ bot, humanMessage }) {
   const msg = String(humanMessage || "").toLowerCase();
   const counts = inventoryCounts(bot);
-  const hasPick = hasAnyTool(counts, ["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond_pickaxe"]);
+  const hasPick = hasAnyTool(counts, [
+    "wooden_pickaxe",
+    "stone_pickaxe",
+    "iron_pickaxe",
+    "diamond_pickaxe",
+  ]);
   const hasAxe = hasAnyTool(counts, ["wooden_axe", "stone_axe", "iron_axe", "diamond_axe"]);
 
   if (msg.includes("fort") || msg.includes("wall") || msg.includes("defense") || msg.includes("build")) {
-    // If we don't have good materials, mine first
+    // Deterministic fort attempt; recovery logic in bot.js will mine when insufficient.
     if (!hasPick) {
       return [
-        { type: "SAY", text: "I’ll craft tools, then mine stone to build a real fort." },
+        { type: "SAY", text: "I’ll craft tools, mine stone, then build a proper fort." },
         { type: "CRAFT_TOOLS" },
-        { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 24, radius: 48 },
+        { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 32, radius: 48 },
       ];
     }
     return [
-      { type: "SAY", text: "Building a recognizable fort (9x9, 4-high walls) using a consistent material." },
+      { type: "SAY", text: "Building a recognizable fort (9x9, 4-high walls) using cobblestone." },
       { type: "BUILD_STRUCTURE", kind: "FORT", size: 9, height: 4, material: "cobblestone" },
     ];
   }
@@ -122,6 +125,21 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   const pos = bot.entity?.position;
   const isNight = bot.time?.isNight ?? false;
   const invSummary = summarizeInventory(bot);
+
+  // Hard off-switch: never call OpenAI when LLM_ENABLED=false.
+  if (!LLM_ENABLED) {
+    const nonLLMPlan = chooseHelpfulPlanNonLLM({ bot, humanMessage });
+    logPlan({
+      bot: bot.username,
+      trigger,
+      non_llm_fallback: true,
+      why: "llm_disabled",
+    });
+    return {
+      say: humanMessage ? clampChat("Got it — I’ll handle this with deterministic logic.") : "",
+      plan: ensurePlanNonEmpty(bot, nonLLMPlan),
+    };
+  }
 
   const menu = [
     `Return ONLY valid JSON. No extra text.`,
@@ -194,23 +212,6 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   const systemStr = String(systemPrompt || "").trim();
   const menuStr = menu.join("\n");
 
-  // Rate limit: if this bot recently called the LLM, skip the API call and keep making progress with non-LLM logic.
-  // This prevents bots from spamming the OpenAI API between steps or after minor failures.
-  if (!canCallLLM(bot.username)) {
-    const nonLLMPlan = chooseHelpfulPlanNonLLM({ bot, humanMessage });
-    logPlan({
-      bot: bot.username,
-      trigger,
-      non_llm_fallback: true,
-      why: `llm_rate_limited:${LLM_MIN_INTERVAL_MINUTES}min`,
-    });
-    return {
-      say: humanMessage ? clampChat("Got it — I’ll keep working and check back soon.") : "",
-      plan: ensurePlanNonEmpty(bot, nonLLMPlan),
-    };
-  }
-
-  // If OpenAI client can't initialize, fallback immediately (never idle)
   let client;
   try {
     client = await getClient();
@@ -237,14 +238,11 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
 
   let text = "";
   try {
-    markLLMCalled(bot.username);
     const resp1 = await doCall(null);
     text = extractText(resp1);
 
     if (!text) {
-      const resp2 = await doCall(
-        "IMPORTANT: Your last response was empty. Return VALID JSON matching the schema now."
-      );
+      const resp2 = await doCall("IMPORTANT: Your last response was empty. Return VALID JSON matching the schema now.");
       text = extractText(resp2);
     }
 
@@ -280,7 +278,6 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   const say = obj?.say ? clampChat(obj.say) : (humanMessage ? "Okay — I’ll work on that." : "");
   const plan = ensurePlanNonEmpty(bot, Array.isArray(obj?.plan) ? obj.plan : null);
 
-  // Enforce: never return SAY-only (must do something useful)
   const nonSay = plan.filter((p) => String(p?.type || "").toUpperCase() !== "SAY");
   if (nonSay.length === 0) {
     const nonLLMPlan = chooseHelpfulPlanNonLLM({ bot, humanMessage });
