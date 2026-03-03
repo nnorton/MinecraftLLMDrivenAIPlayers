@@ -9,6 +9,20 @@ const { pickNextTask } = require("./task_picker");
 const MODEL = process.env.OPENAI_MODEL || "gpt-5-mini";
 const MAX_OUTPUT_TOKENS = parseInt(process.env.OPENAI_MAX_OUTPUT_TOKENS || "1000", 10);
 
+const LLM_MIN_INTERVAL_MINUTES = parseFloat(process.env.LLM_MIN_INTERVAL_MINUTES || "2");
+const LLM_MIN_INTERVAL_MS = Math.max(0, LLM_MIN_INTERVAL_MINUTES) * 60 * 1000;
+
+// Per-bot LLM call timestamps to enforce "no more than once every N minutes"
+const _lastLlmCallAtByBot = new Map();
+function canCallLLM(botUsername) {
+  const now = Date.now();
+  const last = _lastLlmCallAtByBot.get(botUsername) || 0;
+  return now - last >= LLM_MIN_INTERVAL_MS;
+}
+function markLLMCalled(botUsername) {
+  _lastLlmCallAtByBot.set(botUsername, Date.now());
+}
+
 let _client = null;
 async function getClient() {
   if (_client) return _client;
@@ -80,7 +94,7 @@ function chooseHelpfulPlanNonLLM({ bot, humanMessage }) {
       return [
         { type: "SAY", text: "I’ll craft tools, then mine stone to build a real fort." },
         { type: "CRAFT_TOOLS" },
-        { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 24 },
+        { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 24, radius: 48 },
       ];
     }
     return [
@@ -99,7 +113,7 @@ function chooseHelpfulPlanNonLLM({ bot, humanMessage }) {
 
   return [
     { type: "SAY", text: "Continuing useful work: mining and processing resources." },
-    { type: "MINE_BLOCKS", targets: ["coal_ore", "iron_ore", "stone"], count: 12 },
+    { type: "MINE_BLOCKS", targets: ["coal_ore", "iron_ore", "stone"], count: 12, radius: 48 },
     { type: "SMELT_ORE" },
   ];
 }
@@ -180,6 +194,22 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
   const systemStr = String(systemPrompt || "").trim();
   const menuStr = menu.join("\n");
 
+  // Rate limit: if this bot recently called the LLM, skip the API call and keep making progress with non-LLM logic.
+  // This prevents bots from spamming the OpenAI API between steps or after minor failures.
+  if (!canCallLLM(bot.username)) {
+    const nonLLMPlan = chooseHelpfulPlanNonLLM({ bot, humanMessage });
+    logPlan({
+      bot: bot.username,
+      trigger,
+      non_llm_fallback: true,
+      why: `llm_rate_limited:${LLM_MIN_INTERVAL_MINUTES}min`,
+    });
+    return {
+      say: humanMessage ? clampChat("Got it — I’ll keep working and check back soon.") : "",
+      plan: ensurePlanNonEmpty(bot, nonLLMPlan),
+    };
+  }
+
   // If OpenAI client can't initialize, fallback immediately (never idle)
   let client;
   try {
@@ -207,6 +237,7 @@ async function planActions({ systemPrompt, bot, humanMessage, trigger = "autonom
 
   let text = "";
   try {
+    markLLMCalled(bot.username);
     const resp1 = await doCall(null);
     text = extractText(resp1);
 
