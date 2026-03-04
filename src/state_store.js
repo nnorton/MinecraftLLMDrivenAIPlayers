@@ -1,5 +1,5 @@
 // src/state_store.js
-// Lightweight, crash-safe persistence for per-bot state (eg, last successful LLM plan).
+// Lightweight, crash-safe persistence for per-bot state (eg, last successful LLM plan, LLM rate-limit metadata).
 
 const fs = require("fs");
 const fsp = fs.promises;
@@ -25,6 +25,10 @@ function stateDir() {
 
 function planFilePath(username) {
   return path.join(stateDir(), `${sanitizeName(username)}.last_llm_plan.json`);
+}
+
+function llmMetaFilePath(username) {
+  return path.join(stateDir(), `${sanitizeName(username)}.llm_meta.json`);
 }
 
 async function ensureDir() {
@@ -79,9 +83,53 @@ async function loadLastLLMPlan(username) {
   }
 }
 
+/**
+ * Persist lightweight metadata for rate-limiting and other planner bookkeeping.
+ * Intended to be safe to write frequently.
+ */
+async function saveLLMMeta(username, meta) {
+  if (!username) return;
+  await ensureDir();
+  const filePath = llmMetaFilePath(username);
+
+  const record = {
+    schema_version: 1,
+    saved_at: new Date().toISOString(),
+    hostname: os.hostname(),
+    username: String(username),
+    last_call_at_ms: Number.isFinite(meta?.last_call_at_ms) ? meta.last_call_at_ms : 0,
+    last_success_at_ms: Number.isFinite(meta?.last_success_at_ms) ? meta.last_success_at_ms : 0,
+  };
+
+  try {
+    await atomicWriteJson(filePath, record);
+  } catch {
+    // ignore
+  }
+}
+
+async function loadLLMMeta(username) {
+  if (!username) return null;
+  const filePath = llmMetaFilePath(username);
+  try {
+    const txt = await fsp.readFile(filePath, "utf8");
+    const obj = JSON.parse(txt);
+    if (!obj) return null;
+    return {
+      last_call_at_ms: Number.isFinite(obj.last_call_at_ms) ? obj.last_call_at_ms : 0,
+      last_success_at_ms: Number.isFinite(obj.last_success_at_ms) ? obj.last_success_at_ms : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   stateDir,
   planFilePath,
+  llmMetaFilePath,
   saveLastLLMPlan,
   loadLastLLMPlan,
+  saveLLMMeta,
+  loadLLMMeta,
 };
