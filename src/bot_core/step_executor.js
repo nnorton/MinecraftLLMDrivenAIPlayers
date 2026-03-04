@@ -6,6 +6,7 @@ const { buildFort, buildMonument, buildMonumentComplex } = require("../actions/b
 const { craftTools, smeltOre } = require("../actions/craft");
 const { fightMobs } = require("../actions/combat");
 const gather = require("../actions/gather");
+const { simpleFarm } = require("../actions/farm");
 
 const { normalizeType } = require("./utils");
 
@@ -103,6 +104,11 @@ async function executeStep({ bot, step, safeChat, config }) {
       step.max ?? 12,
       step.radius ?? undefined
     );
+    return { status: "done" };
+  }
+
+  if (type === "FARM") {
+    await simpleFarm(bot, step);
     return { status: "done" };
   }
 

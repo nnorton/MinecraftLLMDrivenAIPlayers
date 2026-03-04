@@ -30,6 +30,7 @@ function buildMenuPrompt({ bot, humanMessage }) {
     `- RETURN_BASE: {"type":"RETURN_BASE"}`,
     `- GATHER_WOOD: {"type":"GATHER_WOOD","count":8}`,
     `- MINE_BLOCKS: {"type":"MINE_BLOCKS","targets":["coal_ore","iron_ore","stone"],"count":10}`,
+    `- FARM: {"type":"FARM","crops":["wheat","carrots","potatoes"],"max":12,"size":5}`,
     `- FARM_HARVEST_REPLANT: {"type":"FARM_HARVEST_REPLANT","crops":["wheat","carrots","potatoes"],"max":12}`,
     `- BUILD_STRUCTURE: {"type":"BUILD_STRUCTURE","kind":"FORT","size":9,"height":4,"material":"cobblestone"}`,
     `- BUILD_MONUMENT: {"type":"BUILD_MONUMENT","height":11,"material":"stone_bricks"}`,

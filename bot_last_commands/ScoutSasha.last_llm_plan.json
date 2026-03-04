@@ -1,12 +1,21 @@
 {
   "schema_version": 1,
-  "saved_at": "2026-03-03T08:39:49.468Z",
+  "saved_at": "2026-03-04T02:40:28.464Z",
   "hostname": "ip-172-31-32-164",
   "username": "ScoutSasha",
-  "say": "Starting construction of a 9×9 cobblestone fort now.",
-  "intent": "I will build a cobblestone fort.",
+  "say": "I'll mine stone first, then construct a size-9 cobblestone fort with 4-block walls.",
+  "intent": "Build a cobblestone fort nearby.",
   "trigger": "autonomy",
   "plan": [
+    {
+      "type": "MINE_BLOCKS",
+      "targets": [
+        "coal_ore",
+        "iron_ore",
+        "stone"
+      ],
+      "count": 10
+    },
     {
       "type": "BUILD_STRUCTURE",
       "kind": "FORT",

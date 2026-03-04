@@ -50,7 +50,8 @@ function generalProductiveTask(bot, counts) {
   // If hungry, try farming/food gathering (simple heuristic)
   if (bot.food != null && bot.food <= 10) {
     if (!hasAxe(counts)) return { type: "GATHER_WOOD", count: 12 };
-    return { type: "FARM_HARVEST_REPLANT", crops: ["wheat", "carrots", "potatoes"], max: 10 };
+    // FARM will harvest+replant if crops exist, otherwise it will create a small starter plot.
+    return { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 };
   }
 
   // tools first
@@ -81,7 +82,7 @@ function pickNextTask(bot) {
   const okToDoExtras = hasPickaxe(counts) && (bot.food == null || bot.food > 10);
   if (okToDoExtras && Math.random() < 0.08) {
     return randChoice([
-      { type: "FARM_HARVEST_REPLANT", crops: ["wheat", "carrots", "potatoes"], max: 10 },
+      { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 },
       { type: "BUILD_MONUMENT", height: 11, material: "stone_bricks" },
     ]);
   }
