@@ -18,6 +18,31 @@ const {
   posObj,
 } = require("./utils");
 
+function withTimeout(promise, ms, onTimeout) {
+  const timeoutMs = Math.max(0, parseInt(ms, 10) || 0);
+  if (!timeoutMs) return promise;
+
+  let t;
+  const timeoutPromise = new Promise((_, reject) => {
+    t = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {}
+      reject(new Error(`step timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+    t.unref?.();
+  });
+
+  return Promise.race([
+    promise.finally(() => {
+      try {
+        clearTimeout(t);
+      } catch {}
+    }),
+    timeoutPromise,
+  ]);
+}
+
 function attachEngine({ bot, persona, config }) {
   function safeChat(msg) {
     try {
@@ -190,7 +215,22 @@ function attachEngine({ bot, persona, config }) {
     const stepPos = posObj(bot);
 
     try {
-      const res = await executeStep({ bot, step, safeChat, config });
+      const res = await withTimeout(
+        executeStep({ bot, step, safeChat, config }),
+        config.STEP_TIMEOUT_MS,
+        () => {
+          // Best-effort cleanup to prevent hanging collect/pathfinder promises.
+          try {
+            bot.stopDigging?.();
+          } catch {}
+          try {
+            bot.pathfinder?.setGoal?.(null);
+          } catch {}
+          try {
+            bot.clearControlStates?.();
+          } catch {}
+        }
+      );
 
       if (res?.status === "requeue" && Array.isArray(res.newQueue) && res.newQueue.length) {
         bot._planQueue = [...res.newQueue, ...bot._planQueue.slice(1)];
