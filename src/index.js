@@ -1,10 +1,23 @@
 // src/index.js
 require("dotenv").config();
 
+const { installSafeConsole } = require("./utils/safe_console");
+installSafeConsole();
+
 // Fail-fast: after uncaught errors, exit so PM2 restarts a clean process.
 // Keeping the process alive after an uncaughtException often leaves mineflayer in a bad state.
 function fatalExit(tag, err) {
   const name = process.env.BOT_NAME || process.argv[2] || "bot";
+
+  const isEpipe = err && (err.code === "EPIPE" || String(err.message || "").includes("EPIPE"));
+  if (isEpipe) {
+    // Logging transport failure; don't crash the bot.
+    try {
+      console.error(`[${name}] ${tag}: write EPIPE (stdout/stderr closed). Continuing.`);
+    } catch {}
+    return;
+  }
+
   console.error(`[${name}] ${tag}:`, err);
   // Give logs a moment to flush
   setTimeout(() => process.exit(1), 250).unref?.();
@@ -12,6 +25,18 @@ function fatalExit(tag, err) {
 
 process.on("unhandledRejection", (reason) => fatalExit("unhandledRejection", reason));
 process.on("uncaughtException", (err) => fatalExit("uncaughtException", err));
+
+// Extra signal visibility (PM2 sometimes reports SIGABRT/SIGTERM without context)
+for (const sig of ["SIGTERM", "SIGINT", "SIGABRT"]) {
+  try {
+    process.on(sig, () => {
+      const name = process.env.BOT_NAME || process.argv[2] || "bot";
+      console.warn(`[${name}] received ${sig} (pid=${process.pid})`);
+      // Exit so PM2 can restart if needed
+      process.exit(0);
+    });
+  } catch {}
+}
 
 const personas = require("../personas");
 const { createAgent } = require("./bot");

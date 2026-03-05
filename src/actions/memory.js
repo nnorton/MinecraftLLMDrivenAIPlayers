@@ -11,15 +11,17 @@ function memPath(botName) {
 
 function loadMemory(botName) {
   const p = memPath(botName);
-  if (!fs.existsSync(p)) return { base: null, build_sites: {} };
+  if (!fs.existsSync(p)) return { base: null, build_sites: {}, storage: { chest: null } };
   try {
     const m = JSON.parse(fs.readFileSync(p, "utf8"));
-    if (!m || typeof m !== "object") return { base: null, build_sites: {} };
+    if (!m || typeof m !== "object") return { base: null, build_sites: {}, storage: { chest: null } };
     if (!m.build_sites || typeof m.build_sites !== "object") m.build_sites = {};
     if (!("base" in m)) m.base = null;
+    if (!m.storage || typeof m.storage !== "object") m.storage = { chest: null };
+    if (!("chest" in m.storage)) m.storage.chest = null;
     return m;
   } catch {
-    return { base: null, build_sites: {} };
+    return { base: null, build_sites: {}, storage: { chest: null } };
   }
 }
 
@@ -95,6 +97,25 @@ function clearBuildSite(bot, key) {
   return true;
 }
 
+function getStorageChest(bot) {
+  const mem = loadMemory(bot.username);
+  const p = mem.storage?.chest;
+  if (!p) return null;
+  if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) return null;
+  return p;
+}
+
+function setStorageChest(bot, posOverride) {
+  const mem = loadMemory(bot.username);
+  const pos = posOverride ? posOverride : bot.entity?.position;
+  const p = toBlockPos(pos);
+  if (!p) return null;
+  if (!mem.storage || typeof mem.storage !== "object") mem.storage = { chest: null };
+  mem.storage.chest = p;
+  saveMemory(bot.username, mem);
+  return p;
+}
+
 module.exports = {
   loadMemory,
   saveMemory,
@@ -103,4 +124,6 @@ module.exports = {
   setBuildSite,
   getBuildSite,
   clearBuildSite,
+  getStorageChest,
+  setStorageChest,
 };

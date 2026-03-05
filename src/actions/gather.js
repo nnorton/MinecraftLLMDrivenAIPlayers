@@ -21,9 +21,9 @@ async function yieldEvery(i, every = 12, delayMs = 10) {
   if (i % every === 0) await new Promise((r) => setTimeout(r, delayMs));
 }
 
-function safeChat(bot, msg) {
+function logInfo(bot, msg) {
   try {
-    bot.chat(String(msg || "").slice(0, 220));
+    console.log(`[${bot.username}] [gather] ${String(msg || "").slice(0, 220)}`);
   } catch {}
 }
 
@@ -126,113 +126,76 @@ async function gatherWood(bot, count = 8, radius = DEFAULT_SEARCH_RADIUS) {
 
   const positions = findBlocksByNames(bot, logNames, Math.min(count * 3, 48), radius);
   if (!positions.length) {
-    safeChat(bot, "No trees nearby.");
+    logInfo(bot, "No trees nearby.");
     return 0;
   }
 
   return await collectPositions(bot, positions, count);
 }
 
-async function mineTargets(
-  bot,
-  targets = ["coal_ore", "iron_ore", "stone"],
-  count = 10,
-  radius = DEFAULT_SEARCH_RADIUS
-) {
-  count = clamp(parseInt(count, 10) || 10, 1, 64);
-  const mcData = mcDataLoader(bot.version);
-
-  let valid = Array.isArray(targets) ? targets.map(String) : [];
-  valid = valid.map((t) => t.trim()).filter((t) => mcData.blocksByName[t]);
-  if (!valid.length && mcData.blocksByName["stone"]) valid = ["stone"];
-
-  // Try progressively larger radii so "mine stone" doesn't instantly no-op and cause thrash.
-  let positions = [];
-  const tries = Math.max(1, EXPAND_SEARCH_STEPS);
-  const base = clamp(parseInt(radius, 10) || DEFAULT_SEARCH_RADIUS, 8, MAX_SEARCH_RADIUS);
-
-  for (let i = 0; i < tries; i++) {
-    const r = clamp(
-      base + i * Math.floor((MAX_SEARCH_RADIUS - base) / Math.max(1, tries - 1)),
-      8,
-      MAX_SEARCH_RADIUS
-    );
-    positions = findBlocksByNames(bot, valid, Math.min(count * 4, 80), r);
-    if (positions.length) break;
-    await yieldEvery(i, 1, 20);
-  }
-
-  if (!positions.length) {
-    // Signal failure so caller can inject exploration steps and retry.
-    throw new Error(`No target blocks nearby (targets=${valid.join(",")}, radius<=${MAX_SEARCH_RADIUS})`);
-  }
-
+async function gatherStone(bot, count = 16, radius = DEFAULT_SEARCH_RADIUS) {
+  count = clamp(parseInt(count, 10) || 16, 1, 128);
+  const names = ["stone", "cobblestone", "deepslate", "cobbled_deepslate"];
+  const positions = findBlocksByNames(bot, names, Math.min(count * 3, 64), radius);
+  if (!positions.length) return 0;
   return await collectPositions(bot, positions, count);
 }
 
-async function farmHarvestReplant(
-  bot,
-  crops = ["wheat", "carrots", "potatoes"],
-  max = 12,
-  radius = DEFAULT_SEARCH_RADIUS
-) {
-  max = clamp(parseInt(max, 10) || 12, 1, 64);
+async function gatherCoal(bot, count = 8, radius = DEFAULT_SEARCH_RADIUS) {
+  count = clamp(parseInt(count, 10) || 8, 1, 64);
+  const names = ["coal_ore", "deepslate_coal_ore"];
+  const positions = findBlocksByNames(bot, names, Math.min(count * 3, 32), radius);
+  if (!positions.length) return 0;
+  return await collectPositions(bot, positions, count);
+}
+
+async function gatherIron(bot, count = 8, radius = DEFAULT_SEARCH_RADIUS) {
+  count = clamp(parseInt(count, 10) || 8, 1, 64);
+  const names = ["iron_ore", "deepslate_iron_ore", "raw_iron_block"];
+  const positions = findBlocksByNames(bot, names, Math.min(count * 3, 32), radius);
+  if (!positions.length) return 0;
+  return await collectPositions(bot, positions, count);
+}
+
+async function gatherFood(bot, count = 6, radius = DEFAULT_SEARCH_RADIUS) {
+  count = clamp(parseInt(count, 10) || 6, 1, 64);
+
+  // Simple: break nearby hay bales / wheat if present (depends on environment)
+  const names = ["hay_block", "wheat"];
+  const positions = findBlocksByNames(bot, names, Math.min(count * 2, 24), radius);
+  if (!positions.length) return 0;
+  return await collectPositions(bot, positions, count);
+}
+
+async function gatherCrops(bot, cropNames = ["wheat", "potatoes", "carrots"], count = 12, radius = DEFAULT_SEARCH_RADIUS) {
+  count = clamp(parseInt(count, 10) || 12, 1, 128);
   const mcData = mcDataLoader(bot.version);
 
-  const cropList = Array.isArray(crops) ? crops.map(String) : [];
-  const cropBlocks = cropList.map((c) => c.trim()).filter((c) => mcData.blocksByName[c]);
-  if (!cropBlocks.length) {
-    safeChat(bot, "No valid crops specified.");
+  const valid = (cropNames || [])
+    .map((n) => String(n || "").toLowerCase())
+    .filter((n) => mcData.blocksByName[n]);
+
+  if (!valid.length) {
+    logInfo(bot, "No valid crops specified.");
     return 0;
   }
 
-  const positions = findBlocksByNames(bot, cropBlocks, Math.min(max * 3, 48), radius);
-  if (!positions.length) {
-    safeChat(bot, "No crops nearby.");
-    return 0;
+  let r = radius;
+  for (let step = 0; step < EXPAND_SEARCH_STEPS; step++) {
+    const positions = findBlocksByNames(bot, valid, Math.min(count * 3, 72), r);
+    if (positions.length) return await collectPositions(bot, positions, count);
+    r = clamp(r + Math.round((MAX_SEARCH_RADIUS - radius) / EXPAND_SEARCH_STEPS), radius, MAX_SEARCH_RADIUS);
   }
 
-  const harvested = await collectPositions(bot, positions, max);
-
-  // Replant loop (with yields to avoid timeouts)
-  const inv = bot.inventory.items();
-  let k = 0;
-
-  for (const pos of positions.slice(0, Math.min(positions.length, max))) {
-    const above = bot.blockAt(pos);
-    if (!above) continue;
-
-    if (above.name !== "air") continue;
-
-    const below = bot.blockAt(pos.offset(0, -1, 0));
-    if (!below || below.name !== "farmland") continue;
-
-    const plantOptions = [
-      { block: "wheat", item: "wheat_seeds" },
-      { block: "carrots", item: "carrot" },
-      { block: "potatoes", item: "potato" },
-    ];
-
-    const opt = plantOptions.find((o) => cropBlocks.includes(o.block));
-    if (!opt) continue;
-
-    const seed = inv.find((it) => it.name === opt.item);
-    if (!seed) continue;
-
-    try {
-      await bot.equip(seed, "hand");
-      await bot.placeBlock(below, new Vec3(0, 1, 0));
-      await yieldEvery(++k, 6, 25);
-    } catch {
-      continue;
-    }
-  }
-
-  return harvested;
+  logInfo(bot, "No crops nearby.");
+  return 0;
 }
 
 module.exports = {
   gatherWood,
-  mineTargets,
-  farmHarvestReplant,
+  gatherStone,
+  gatherCoal,
+  gatherIron,
+  gatherFood,
+  gatherCrops,
 };

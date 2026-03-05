@@ -27,11 +27,22 @@ function remediateInsufficientMaterial({ step, parsed }) {
   const wantExtra = Math.max(16, Math.min(96, deficit + buffer));
   const mineTarget = mineTargetForMaterial(material);
 
+  // First attempt: try pulling from storage.
+  // This is cheap compared to re-mining, and helps when bots already stockpiled.
+  // Skip wildcard/unknown materials.
+  const canTryRetrieve =
+    material &&
+    typeof material === "string" &&
+    !material.includes("*") &&
+    !material.includes(" ") &&
+    material.length > 0;
+
   if (material.endsWith("_planks")) {
     return {
       ok: true,
       reason: `gather_wood_for_${material}`,
       newQueue: [
+        ...(canTryRetrieve ? [{ type: "STORAGE_RETRIEVE", item: material, count: wantExtra }] : []),
         { type: "GATHER_WOOD", count: 12, radius: 80 },
         { type: "CRAFT_TOOLS" },
         step,
@@ -43,7 +54,11 @@ function remediateInsufficientMaterial({ step, parsed }) {
     return {
       ok: true,
       reason: `fallback_wander_for_${material}`,
-      newQueue: [{ type: "WANDER", radius: 18, maxMs: 12000 }, step],
+      newQueue: [
+        ...(canTryRetrieve ? [{ type: "STORAGE_RETRIEVE", item: material, count: wantExtra }] : []),
+        { type: "WANDER", radius: 18, maxMs: 12000 },
+        step,
+      ],
     };
   }
 
@@ -51,6 +66,7 @@ function remediateInsufficientMaterial({ step, parsed }) {
     ok: true,
     reason: `stockpile_${material}`,
     newQueue: [
+      ...(canTryRetrieve ? [{ type: "STORAGE_RETRIEVE", item: material, count: wantExtra }] : []),
       { type: "CRAFT_TOOLS" },
       { type: "MINE_BLOCKS", targets: [mineTarget, "coal_ore"], count: wantExtra, radius: 72 },
       step,

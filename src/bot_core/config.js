@@ -50,6 +50,18 @@ const UNSTUCK_STAGE1_MS = parseInt(process.env.UNSTUCK_STAGE1_MS || "9000", 10);
 const TEAM_PREFIX = "[TEAM]";
 const TEAM_EVENT_RATE_MS = 2500;
 
+// ---- Status logging (optional; used if you have status_logger.js wired in) ----
+const STATUS_LOG_INTERVAL_MS = parseInt(process.env.STATUS_LOG_INTERVAL_MS || "15000", 10);
+const STATUS_LOG_ON_CHANGE = parseBool(process.env.STATUS_LOG_ON_CHANGE, true);
+const STATUS_LOG_INCLUDE_GOAL = parseBool(process.env.STATUS_LOG_INCLUDE_GOAL, false);
+
+// ---- Anti-tight-loop pacing (prevents ms=0 loops that cause disconnects) ----
+const MIN_STEP_GAP_MS = parseInt(process.env.MIN_STEP_GAP_MS || "200", 10); // minimum delay after any "done" step
+const FAST_STEP_MS_THRESHOLD = parseInt(process.env.FAST_STEP_MS_THRESHOLD || "25", 10); // classify as "too fast"
+const FAST_STEP_MAX_STREAK = parseInt(process.env.FAST_STEP_MAX_STREAK || "8", 10); // after N fast steps…
+const FAST_STEP_BACKOFF_BASE_MS = parseInt(process.env.FAST_STEP_BACKOFF_BASE_MS || "250", 10); // start backoff
+const FAST_STEP_BACKOFF_MAX_MS = parseInt(process.env.FAST_STEP_BACKOFF_MAX_MS || "5000", 10); // cap backoff
+
 module.exports = {
   parseBool,
   AUTONOMY_INTERVAL_MS,
@@ -70,4 +82,12 @@ module.exports = {
   UNSTUCK_STAGE1_MS,
   TEAM_PREFIX,
   TEAM_EVENT_RATE_MS,
+  STATUS_LOG_INTERVAL_MS,
+  STATUS_LOG_ON_CHANGE,
+  STATUS_LOG_INCLUDE_GOAL,
+  MIN_STEP_GAP_MS,
+  FAST_STEP_MS_THRESHOLD,
+  FAST_STEP_MAX_STREAK,
+  FAST_STEP_BACKOFF_BASE_MS,
+  FAST_STEP_BACKOFF_MAX_MS,
 };

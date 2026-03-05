@@ -1,27 +1,18 @@
 {
   "schema_version": 1,
-  "saved_at": "2026-03-04T02:40:28.464Z",
+  "saved_at": "2026-03-05T06:16:42.502Z",
   "hostname": "ip-172-31-32-164",
   "username": "ScoutSasha",
-  "say": "I'll mine stone first, then construct a size-9 cobblestone fort with 4-block walls.",
-  "intent": "Build a cobblestone fort nearby.",
-  "trigger": "autonomy",
+  "say": "Noted — I'll wander to find trees and then gather wood.",
+  "intent": "I'll search for nearby trees and collect wood.",
+  "trigger": "human_deferred",
   "plan": [
     {
-      "type": "MINE_BLOCKS",
-      "targets": [
-        "coal_ore",
-        "iron_ore",
-        "stone"
-      ],
-      "count": 10
+      "type": "WANDER"
     },
     {
-      "type": "BUILD_STRUCTURE",
-      "kind": "FORT",
-      "size": 9,
-      "height": 4,
-      "material": "cobblestone"
+      "type": "GATHER_WOOD",
+      "count": 8
     }
   ]
 }

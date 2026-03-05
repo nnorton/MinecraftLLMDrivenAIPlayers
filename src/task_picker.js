@@ -40,8 +40,14 @@ function randChoice(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+function canDo(bot, type) {
+  const t = normalizeType(type);
+  const cd = bot?._cooldowns?.[t];
+  if (!cd) return true;
+  return Date.now() >= cd;
+}
+
 function stockpileBuildingBlocksTask(bot, counts) {
-  // get stone/cobble for building
   if (!hasPickaxe(counts)) return { type: "CRAFT_TOOLS" };
   return { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 36 };
 }
@@ -50,8 +56,13 @@ function generalProductiveTask(bot, counts) {
   // If hungry, try farming/food gathering (simple heuristic)
   if (bot.food != null && bot.food <= 10) {
     if (!hasAxe(counts)) return { type: "GATHER_WOOD", count: 12 };
-    // FARM will harvest+replant if crops exist, otherwise it will create a small starter plot.
-    return { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 };
+
+    if (canDo(bot, "FARM")) {
+      return { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 };
+    }
+
+    // FARM is on cooldown: do something else to avoid idle/tight loops.
+    return { type: "MINE_BLOCKS", targets: ["coal_ore", "stone"], count: 10 };
   }
 
   // tools first
@@ -70,7 +81,6 @@ function generalProductiveTask(bot, counts) {
 function pickNextTask(bot) {
   const counts = invCounts(bot);
 
-  // If a recent build failed, prioritize stockpiling
   const fails = recentFailuresFor ? recentFailuresFor(bot.username, 15 * 60 * 1000) : [];
   const recentBuildFail = (fails || []).some((f) => normalizeType(f?.type).includes("BUILD"));
 
@@ -81,17 +91,17 @@ function pickNextTask(bot) {
   // Occasionally do something fun
   const okToDoExtras = hasPickaxe(counts) && (bot.food == null || bot.food > 10);
   if (okToDoExtras && Math.random() < 0.08) {
-    return randChoice([
-      { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 },
-      { type: "BUILD_MONUMENT", height: 11, material: "stone_bricks" },
-    ]);
+    return randChoice(
+      [
+        canDo(bot, "FARM") ? { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 } : null,
+        { type: "BUILD_MONUMENT", height: 11, material: "stone_bricks" },
+      ].filter(Boolean)
+    );
   }
 
   return generalProductiveTask(bot, counts);
 }
 
-// Very small "human message -> deterministic plan" helper.
-// This prevents idle behavior when LLM is off or LLM returns nothing.
 function deterministicPlan(bot, message) {
   const m = String(message || "").toLowerCase();
   if (m.includes("wood")) return [{ type: "GATHER_WOOD", count: 16 }];

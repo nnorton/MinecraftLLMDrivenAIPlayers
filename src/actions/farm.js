@@ -1,13 +1,5 @@
 // src/actions/farm.js
 // Simple farming action for Mineflayer bots.
-//
-// Goals:
-// - If crops already exist nearby: harvest + replant (delegates to gather.farmHarvestReplant)
-// - Otherwise: create a tiny starter crop plot (till soil + optionally place water + plant)
-//
-// Notes:
-// - This is intentionally “best effort” and avoids hard-failing on minor interaction issues.
-// - We avoid chatting from inside this action; callers can decide what to say.
 
 const mcDataLoader = require("minecraft-data");
 const { Vec3 } = require("vec3");
@@ -35,7 +27,6 @@ function hasAny(bot, names) {
 }
 
 function pickSeedItem(bot) {
-  // Prefer seeds for wheat, then carrots/potatoes.
   const inv = bot.inventory?.items?.() || [];
   const prefer = ["wheat_seeds", "carrot", "potato", "beetroot_seeds"];
   for (const name of prefer) {
@@ -106,7 +97,6 @@ async function tryTill(bot, hoeItem, groundBlock) {
   if (!hoeItem || !groundBlock) return false;
   try {
     await bot.equip(hoeItem, "hand");
-    // Hoe is a right-click interaction.
     await bot.activateBlock(groundBlock);
     await sleep(50);
     return true;
@@ -128,7 +118,6 @@ async function tryPlant(bot, seedItem, farmlandBlock) {
 }
 
 async function tryPlaceWater(bot, groundBlock) {
-  // We want to create a 1-deep hole and place water in it.
   const inv = bot.inventory?.items?.() || [];
   const water = inv.find((i) => i.name === "water_bucket");
   if (!water) return false;
@@ -136,7 +125,6 @@ async function tryPlaceWater(bot, groundBlock) {
   try {
     const current = bot.blockAt(groundBlock.position);
     if (current && current.name !== "air" && current.name !== "water") {
-      // Dig the block to make a hole.
       await bot.dig(current);
       await sleep(80);
     }
@@ -145,7 +133,6 @@ async function tryPlaceWater(bot, groundBlock) {
     if (!below) return false;
 
     await bot.equip(water, "hand");
-    // Activate the block below so water pours into the hole.
     await bot.activateBlock(below);
     await sleep(120);
     return true;
@@ -162,7 +149,6 @@ function findCandidateGround(bot, radius = 6) {
   const ids = groundNames.map((n) => mcData.blocksByName[n].id);
   if (!ids.length) return null;
 
-  // Find a nearby ground block with air above it.
   try {
     return (
       bot.findBlock({
@@ -183,7 +169,7 @@ function findCandidateGround(bot, radius = 6) {
 
 async function createAndPlantPlot(bot, { size = 5, radius = 6 } = {}) {
   size = clamp(parseInt(size, 10) || 5, 3, 9);
-  if (size % 2 === 0) size += 1; // prefer odd sizes
+  if (size % 2 === 0) size += 1;
 
   const centerGround = findCandidateGround(bot, radius);
   if (!centerGround) return { ok: false, planted: 0, tilled: 0, reason: "no_ground" };
@@ -191,11 +177,11 @@ async function createAndPlantPlot(bot, { size = 5, radius = 6 } = {}) {
   const seedItem = pickSeedItem(bot);
   const hoeItem = await ensureHoe(bot);
 
-  // Build list of positions for the square.
+  if (!hoeItem) return { ok: false, planted: 0, tilled: 0, reason: "no_hoe" };
+
   const half = Math.floor(size / 2);
   const base = centerGround.position;
 
-  // Optionally place water at the center (best-effort).
   const wantsWater = hasAny(bot, ["water_bucket"]);
   if (wantsWater) {
     const center = bot.blockAt(base);
@@ -211,8 +197,6 @@ async function createAndPlantPlot(bot, { size = 5, radius = 6 } = {}) {
       await yieldEvery(++idx, 10, 12);
 
       const p = base.offset(dx, 0, dz);
-
-      // Skip the center tile if we placed water there.
       if (wantsWater && dx === 0 && dz === 0) continue;
 
       const ground = bot.blockAt(p);
@@ -221,7 +205,6 @@ async function createAndPlantPlot(bot, { size = 5, radius = 6 } = {}) {
       const above = bot.blockAt(p.offset(0, 1, 0));
       if (!above || above.name !== "air") continue;
 
-      // Till dirt/grass into farmland.
       if (ground.name !== "farmland") {
         const okTill = await tryTill(bot, hoeItem, ground);
         if (!okTill) continue;
@@ -229,7 +212,6 @@ async function createAndPlantPlot(bot, { size = 5, radius = 6 } = {}) {
         await sleep(40);
       }
 
-      // Re-fetch: block might now be farmland.
       const soil = bot.blockAt(p);
       if (!soil || soil.name !== "farmland") continue;
 
@@ -240,33 +222,33 @@ async function createAndPlantPlot(bot, { size = 5, radius = 6 } = {}) {
     }
   }
 
-  return { ok: planted > 0 || tilled > 0, planted, tilled, crop: seedToCropBlock(seedItem?.name) };
+  if (planted > 0 || tilled > 0) {
+    return { ok: true, planted, tilled, crop: seedToCropBlock(seedItem?.name) };
+  }
+
+  // Nothing happened: avoid returning ok=true and causing FARM tight-loops.
+  if (!seedItem) return { ok: false, planted: 0, tilled, reason: "no_seeds" };
+  return { ok: false, planted, tilled, reason: "no_progress" };
 }
 
-/**
- * Primary entrypoint for a single FARM step.
- *
- * Behavior:
- * - If there are any crops nearby: harvest+replant up to max
- * - Else: create a small crop plot and plant what we can
- */
 async function simpleFarm(bot, step = {}) {
   const radius = clamp(parseInt(step.radius, 10) || 16, 6, 64);
   const max = clamp(parseInt(step.max, 10) || 12, 1, 64);
   const size = clamp(parseInt(step.size, 10) || 5, 3, 9);
 
-  // If there are crops nearby, harvest+replant (existing behavior).
   const crops = Array.isArray(step.crops) && step.crops.length ? step.crops : ["wheat", "carrots", "potatoes"];
   const cropBlocks = crops.map(String).map((s) => s.trim());
+
   const found = findAnyNearbyCrop(bot, cropBlocks, radius);
   if (found) {
     await gather.farmHarvestReplant(bot, cropBlocks, max, radius);
     return { ok: true, mode: "harvest" };
   }
 
-  // Otherwise, create a starter plot.
   const res = await createAndPlantPlot(bot, { size, radius: Math.min(10, radius) });
-  return { ok: !!res.ok, mode: "create", ...res };
+  if (res?.ok) return { ok: true, mode: "create", ...res };
+
+  return { ok: false, mode: "create", reason: res?.reason || "create_failed", ...res };
 }
 
 module.exports = { simpleFarm };

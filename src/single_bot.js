@@ -1,14 +1,31 @@
 // src/single_bot.js
 require("dotenv").config();
 
+const { installSafeConsole } = require("./utils/safe_console");
+installSafeConsole();
+
 // Keep the process alive on unexpected async errors. PM2 can still restart us,
 // but avoiding hard crashes reduces bot dropouts.
 process.on("unhandledRejection", (reason) => {
+  const isEpipe = reason && (reason.code === "EPIPE" || String(reason.message || "").includes("EPIPE"));
+  if (isEpipe) return;
   console.error(`[${process.env.BOT_NAME || process.argv[2] || "bot"}] unhandledRejection:`, reason);
 });
 process.on("uncaughtException", (err) => {
+  const isEpipe = err && (err.code === "EPIPE" || String(err.message || "").includes("EPIPE"));
+  if (isEpipe) return;
   console.error(`[${process.env.BOT_NAME || process.argv[2] || "bot"}] uncaughtException:`, err);
 });
+
+for (const sig of ["SIGTERM", "SIGINT", "SIGABRT"]) {
+  try {
+    process.on(sig, () => {
+      const name = process.env.BOT_NAME || process.argv[2] || "bot";
+      console.warn(`[${name}] received ${sig} (pid=${process.pid})`);
+      process.exit(0);
+    });
+  } catch {}
+}
 
 const personas = require("../personas");
 const { createAgent } = require("./bot");

@@ -16,7 +16,6 @@ function isMovementType(type) {
 
 async function executeStep({ bot, step, safeChat, config }) {
   const type = normalizeType(step?.type);
-
   if (!type) return { status: "done" };
 
   if (type === "SAY") {
@@ -108,8 +107,23 @@ async function executeStep({ bot, step, safeChat, config }) {
   }
 
   if (type === "FARM") {
-    await simpleFarm(bot, step);
-    return { status: "done" };
+    const res = await simpleFarm(bot, step);
+
+    if (res?.ok) return { status: "done" };
+
+    // If FARM couldn’t do anything, avoid hammering FARM in a tight loop.
+    bot._cooldowns = bot._cooldowns || {};
+    bot._cooldowns.FARM = Date.now() + 60 * 1000; // 60s
+
+    // Requeue a productive fallback instead of retrying FARM immediately.
+    return {
+      status: "requeue",
+      newQueue: [
+        { type: "PAUSE", ms: 1200 },
+        { type: "WANDER", radius: 18, maxMs: 9000 },
+        { type: "MINE_BLOCKS", targets: ["coal_ore", "iron_ore", "stone"], count: 10 },
+      ],
+    };
   }
 
   if (type === "BUILD_STRUCTURE") {
@@ -172,7 +186,6 @@ async function executeStep({ bot, step, safeChat, config }) {
     return { status: "done" };
   }
 
-  // Unknown step => drop
   return { status: "done" };
 }
 

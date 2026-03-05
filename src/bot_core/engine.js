@@ -28,10 +28,15 @@ function attachEngine({ bot, persona, config }) {
   function scheduleEnsureWork() {
     if (bot._ensureScheduled) return;
     bot._ensureScheduled = true;
-    setImmediate(() => {
+
+    const now = Date.now();
+    const nextAt = bot._nextWorkAt || 0;
+    const delay = Math.max(0, nextAt - now);
+
+    setTimeout(() => {
       bot._ensureScheduled = false;
       ensureWork();
-    });
+    }, delay).unref?.();
   }
 
   function ensureWork() {
@@ -39,11 +44,13 @@ function attachEngine({ bot, persona, config }) {
     if (bot._planning) return;
     if (bot._executing) return;
 
+    const now = Date.now();
+    if (bot._nextWorkAt && now < bot._nextWorkAt) return;
+
     // If we are currently in a movement step, don't restart work.
     const curType = normalizeType(bot._current?.type);
     if (curType === "WANDER" || curType === "GOTO" || curType === "FOLLOW") return;
 
-    const now = Date.now();
     const hasWork = bot._planQueue.length > 0;
 
     if (!hasWork) {
@@ -123,6 +130,43 @@ function attachEngine({ bot, persona, config }) {
     executeNextStep().catch(() => {});
   }
 
+  function applyStepPacing(type, ms) {
+    const now = Date.now();
+
+    // Always enforce a minimum gap after "done" steps to avoid tight loops.
+    const baseGap = Math.max(0, config.MIN_STEP_GAP_MS || 0);
+    bot._nextWorkAt = Math.max(bot._nextWorkAt || 0, now + baseGap);
+
+    // Track fast-step streaks (typical of “no-op” actions like FARM when no crops/seed/ground exist).
+    const thresh = Math.max(1, config.FAST_STEP_MS_THRESHOLD || 25);
+
+    const isFast = typeof ms === "number" && ms <= thresh;
+    const sameType = type && bot._lastDoneType === type;
+
+    if (isFast && sameType) bot._fastStreak = (bot._fastStreak || 0) + 1;
+    else if (isFast) bot._fastStreak = 1;
+    else bot._fastStreak = 0;
+
+    bot._lastDoneType = type;
+
+    const maxStreak = Math.max(1, config.FAST_STEP_MAX_STREAK || 8);
+    if (bot._fastStreak >= maxStreak) {
+      // Exponential backoff once we cross the streak threshold.
+      const over = bot._fastStreak - maxStreak;
+      const base = Math.max(50, config.FAST_STEP_BACKOFF_BASE_MS || 250);
+      const cap = Math.max(base, config.FAST_STEP_BACKOFF_MAX_MS || 5000);
+
+      const backoff = Math.min(cap, Math.floor(base * Math.pow(2, Math.min(6, over))));
+      bot._nextWorkAt = Math.max(bot._nextWorkAt || 0, now + backoff);
+
+      try {
+        console.warn(
+          `[${bot.username}] [pacing] fast-loop detected type=${type} streak=${bot._fastStreak} -> backoff=${backoff}ms`
+        );
+      } catch {}
+    }
+  }
+
   async function executeNextStep() {
     if (bot._executing) return;
     if (!bot._planQueue.length) return;
@@ -131,8 +175,13 @@ function attachEngine({ bot, persona, config }) {
     const startedAt = Date.now();
     const step = bot._planQueue[0];
     bot._current = step;
+    bot._currentStartedAt = Date.now();
 
     const type = normalizeType(step?.type);
+
+    try {
+      console.log(`[${bot.username}] [job] start ${type || "UNKNOWN"} q=${bot._planQueue.length}`);
+    } catch {}
 
     if (isMajorStepType(type)) {
       bot._commitUntil = Math.max(bot._commitUntil || 0, Date.now() + config.PLAN_COMMIT_MS);
@@ -157,6 +206,13 @@ function attachEngine({ bot, persona, config }) {
       // done => shift
       bot._planQueue.shift();
 
+      const ms = Date.now() - startedAt;
+      try {
+        console.log(`[${bot.username}] [job] done ${type || "UNKNOWN"} ms=${ms} q=${bot._planQueue.length}`);
+      } catch {}
+
+      applyStepPacing(type, ms);
+
       if (
         type !== "SAY" &&
         type !== "WANDER" &&
@@ -166,14 +222,22 @@ function attachEngine({ bot, persona, config }) {
       ) {
         postEvent(bot.username, `${config.TEAM_PREFIX} ok ${type}`, "action_ok", {
           type,
-          ms: Date.now() - startedAt,
+          ms,
           pos: stepPos,
           pos2: posObj(bot),
         });
       }
     } catch (e) {
+      const ms = Date.now() - startedAt;
       const reason = shortErr(e);
+
       console.error(`[${bot.username}] step failed`, e?.message || e);
+      try {
+        console.log(`[${bot.username}] [job] fail ${type || "UNKNOWN"} ms=${ms} reason=${reason}`);
+      } catch {}
+
+      // Even on failures, pace a bit so failure loops don’t melt the event loop.
+      applyStepPacing(type, ms);
 
       const parsed = parseInsufficientMaterial(reason);
       if (parsed && bot._current) {
@@ -183,7 +247,7 @@ function attachEngine({ bot, persona, config }) {
             type,
             reason: remediation.reason,
             err: reason,
-            ms: Date.now() - startedAt,
+            ms,
             pos: stepPos,
             pos2: posObj(bot),
           });
@@ -202,7 +266,7 @@ function attachEngine({ bot, persona, config }) {
             type,
             reason: `build_incomplete_${tries}`,
             err: reason,
-            ms: Date.now() - startedAt,
+            ms,
             pos: stepPos,
             pos2: posObj(bot),
             completionPct: incomplete.completionPct,
@@ -229,7 +293,7 @@ function attachEngine({ bot, persona, config }) {
             type,
             reason: `pathfinder_retry_${tries}`,
             err: reason,
-            ms: Date.now() - startedAt,
+            ms,
             pos: stepPos,
             pos2: posObj(bot),
           });
@@ -249,7 +313,7 @@ function attachEngine({ bot, persona, config }) {
       postEvent(bot.username, `${config.TEAM_PREFIX} fail ${type}: ${reason}`, "action_fail", {
         type,
         reason,
-        ms: Date.now() - startedAt,
+        ms,
         pos: stepPos,
         pos2: posObj(bot),
       });
@@ -257,6 +321,7 @@ function attachEngine({ bot, persona, config }) {
       bot._current = null;
     } finally {
       bot._executing = false;
+      if (!bot._current) bot._currentStartedAt = null;
       scheduleEnsureWork();
     }
   }
