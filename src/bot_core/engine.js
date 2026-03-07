@@ -5,7 +5,7 @@ const { postEvent } = require("../team_bus");
 const { pickNextTask } = require("../task_picker");
 
 const { deterministicPlan } = require("./deterministic_plan");
-const { remediateInsufficientMaterial } = require("./remediation");
+const { remediateInsufficientMaterial, remediateMissingBuildComponent, remediateNoPlaceableMaterial } = require("./remediation");
 const { executeStep } = require("./step_executor");
 const {
   dbg,
@@ -13,6 +13,8 @@ const {
   normalizeType,
   isMajorStepType,
   parseInsufficientMaterial,
+  parseMissingBuildComponent,
+  parseNoPlaceableMaterial,
   parseBuildIncomplete,
   isPathfinderPlanningError,
   posObj,
@@ -72,178 +74,133 @@ function attachEngine({ bot, persona, config }) {
     const now = Date.now();
     if (bot._nextWorkAt && now < bot._nextWorkAt) return;
 
-    // If we are currently in a movement step, don't restart work.
     const curType = normalizeType(bot._current?.type);
     if (curType === "WANDER" || curType === "GOTO" || curType === "FOLLOW") return;
 
     const hasWork = bot._planQueue.length > 0;
 
     if (!hasWork) {
-      if (bot._pendingHuman && !bot._planning) {
-        const pending = bot._pendingHuman;
-        bot._pendingHuman = null;
-        bot._lastHumanAt = Date.now();
-        bot._planning = true;
+      if (Date.now() - (bot._lastHumanAt || 0) <= config.COOLDOWN_ON_HUMAN_MS) return;
 
-        const personaPrompt = persona?.systemPrompt || "";
+      if (Date.now() < (bot._commitUntil || 0) && bot._planQueue.length > 0) return;
 
-        const planPromise = config.LLM_ENABLED
-          ? planActions({
-              systemPrompt: personaPrompt,
-              bot,
-              humanMessage: pending.text,
-              trigger: "human_deferred",
-            })
-          : Promise.resolve({ say: "", plan: deterministicPlan(bot, pending.text) });
+      const pendingHuman = bot._pendingHuman;
+      bot._pendingHuman = null;
 
-        planPromise
-          .then((res) => {
-            if (res?.say) safeChat(res.say);
-            if (Array.isArray(res?.plan)) bot._planQueue = res.plan;
-          })
-          .catch((e) => {
-            console.error(`[${bot.username}] deferred planning failed`, e?.message || e);
-            bot._planQueue = deterministicPlan(bot, pending.text);
-          })
-          .finally(() => {
-            bot._planning = false;
-            scheduleEnsureWork();
-          });
-        return;
-      }
+      bot._planning = true;
 
-      if (now - bot._lastHumanAt < config.COOLDOWN_ON_HUMAN_MS) return;
+      (async () => {
+        try {
+          let plan = null;
+          if (pendingHuman) {
+            try {
+              plan = await planActions(bot, persona, pendingHuman);
+            } catch {}
+            if (!Array.isArray(plan) || !plan.length) {
+              plan = deterministicPlan(bot, pendingHuman);
+            }
+          } else {
+            const picked = pickNextTask(bot);
+            if (picked) plan = [picked];
+            if (!Array.isArray(plan) || !plan.length) {
+              plan = deterministicPlan(bot, "");
+            }
+          }
 
-      if (now - bot._lastAutonomyAt > config.AUTONOMY_INTERVAL_MS) {
-        bot._lastAutonomyAt = now;
-        bot._planning = true;
+          if (!Array.isArray(plan) || !plan.length) {
+            plan = [{ type: "WANDER", radius: 20, maxMs: 12000 }];
+          }
 
-        const personaPrompt = persona?.systemPrompt || "";
+          bot._planQueue = plan;
+          bot._commitUntil = Date.now() + config.PLAN_COMMIT_MS;
+        } catch (e) {
+          console.error(`[${bot.username}] planning failed`, e?.message || e);
+          bot._planQueue = [{ type: "WANDER", radius: 16, maxMs: 10000 }];
+        } finally {
+          bot._planning = false;
+          scheduleEnsureWork();
+        }
+      })();
 
-        const planPromise = config.LLM_ENABLED
-          ? planActions({ systemPrompt: personaPrompt, bot, humanMessage: null, trigger: "autonomy" })
-          : Promise.resolve({
-              say: "",
-              plan: pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }],
-            });
-
-        planPromise
-          .then((res) => {
-            if (res?.say) safeChat(res.say);
-            if (Array.isArray(res?.plan)) bot._planQueue = res.plan;
-          })
-          .catch((e) => {
-            console.error(`[${bot.username}] planning failed`, e?.message || e);
-            bot._planQueue = pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }];
-          })
-          .finally(() => {
-            bot._planning = false;
-            scheduleEnsureWork();
-          });
-        return;
-      }
-
-      bot._planQueue = pickNextTask(bot) ? [pickNextTask(bot)] : [{ type: "WANDER" }];
+      return;
     }
 
-    const nextType = normalizeType(bot._planQueue?.[0]?.type);
-    if (config.DEBUG_BOT && nextType && nextType !== bot._lastStepLogType) {
-      bot._lastStepLogType = nextType;
-      dbg(bot, `next step -> ${nextType}`, true);
+    const step = bot._planQueue[0];
+    const type = normalizeType(step?.type);
+
+    if (!type) {
+      bot._planQueue.shift();
+      scheduleEnsureWork();
+      return;
     }
 
-    executeNextStep().catch(() => {});
-  }
-
-  function applyStepPacing(type, ms) {
-    const now = Date.now();
-
-    // Always enforce a minimum gap after "done" steps to avoid tight loops.
-    const baseGap = Math.max(0, config.MIN_STEP_GAP_MS || 0);
-    bot._nextWorkAt = Math.max(bot._nextWorkAt || 0, now + baseGap);
-
-    // Track fast-step streaks (typical of “no-op” actions like FARM when no crops/seed/ground exist).
-    const thresh = Math.max(1, config.FAST_STEP_MS_THRESHOLD || 25);
-
-    const isFast = typeof ms === "number" && ms <= thresh;
-    const sameType = type && bot._lastDoneType === type;
-
-    if (isFast && sameType) bot._fastStreak = (bot._fastStreak || 0) + 1;
-    else if (isFast) bot._fastStreak = 1;
-    else bot._fastStreak = 0;
-
-    bot._lastDoneType = type;
-
-    const maxStreak = Math.max(1, config.FAST_STEP_MAX_STREAK || 8);
-    if (bot._fastStreak >= maxStreak) {
-      // Exponential backoff once we cross the streak threshold.
-      const over = bot._fastStreak - maxStreak;
-      const base = Math.max(50, config.FAST_STEP_BACKOFF_BASE_MS || 250);
-      const cap = Math.max(base, config.FAST_STEP_BACKOFF_MAX_MS || 5000);
-
-      const backoff = Math.min(cap, Math.floor(base * Math.pow(2, Math.min(6, over))));
-      bot._nextWorkAt = Math.max(bot._nextWorkAt || 0, now + backoff);
-
+    if (bot._current !== step) {
+      bot._current = step;
+      bot._currentStartedAt = Date.now();
       try {
-        console.warn(
-          `[${bot.username}] [pacing] fast-loop detected type=${type} streak=${bot._fastStreak} -> backoff=${backoff}ms`
-        );
+        console.log(`[${bot.username}] [job] start ${type} q=${bot._planQueue.length}`);
       } catch {}
     }
-  }
-
-  async function executeNextStep() {
-    if (bot._executing) return;
-    if (!bot._planQueue.length) return;
 
     bot._executing = true;
     const startedAt = Date.now();
-    const step = bot._planQueue[0];
-    bot._current = step;
-    bot._currentStartedAt = Date.now();
-
-    const type = normalizeType(step?.type);
-
-    try {
-      console.log(`[${bot.username}] [job] start ${type || "UNKNOWN"} q=${bot._planQueue.length}`);
-    } catch {}
-
-    if (isMajorStepType(type)) {
-      bot._commitUntil = Math.max(bot._commitUntil || 0, Date.now() + config.PLAN_COMMIT_MS);
-    }
-
     const stepPos = posObj(bot);
+
+    function applyStepPacing(type, ms) {
+      const minGap = config.MIN_STEP_GAP_MS || 0;
+
+      const isFast = ms <= (config.FAST_STEP_MS_THRESHOLD || 25);
+      if (isFast) {
+        bot._fastStepStreak = (bot._fastStepStreak || 0) + 1;
+      } else {
+        bot._fastStepStreak = 0;
+      }
+
+      let backoff = 0;
+      if ((bot._fastStepStreak || 0) >= (config.FAST_STEP_MAX_STREAK || 8)) {
+        const extra = (bot._fastStepStreak || 0) - (config.FAST_STEP_MAX_STREAK || 8);
+        backoff = Math.min(
+          (config.FAST_STEP_BACKOFF_BASE_MS || 250) * Math.pow(2, extra),
+          config.FAST_STEP_BACKOFF_MAX_MS || 5000
+        );
+        try {
+          console.log(
+            `[${bot.username}] [pacing] fast-loop detected type=${type} streak=${bot._fastStepStreak} -> backoff=${backoff}ms`
+          );
+        } catch {}
+      }
+
+      const gap = Math.max(minGap, backoff);
+      bot._nextWorkAt = Date.now() + gap;
+    }
 
     try {
       const res = await withTimeout(
         executeStep({ bot, step, safeChat, config }),
         config.STEP_TIMEOUT_MS,
         () => {
-          // Best-effort cleanup to prevent hanging collect/pathfinder promises.
           try {
-            bot.stopDigging?.();
+            bot.pathfinder.setGoal(null);
           } catch {}
           try {
-            bot.pathfinder?.setGoal?.(null);
-          } catch {}
-          try {
-            bot.clearControlStates?.();
+            bot.clearControlStates();
           } catch {}
         }
       );
 
-      if (res?.status === "requeue" && Array.isArray(res.newQueue) && res.newQueue.length) {
-        bot._planQueue = [...res.newQueue, ...bot._planQueue.slice(1)];
+      if (res?.status === "requeue") {
+        bot._planQueue = Array.isArray(res.newQueue) ? res.newQueue : bot._planQueue.slice(1);
         bot._current = null;
+        bot._currentStartedAt = null;
+        const ms = Date.now() - startedAt;
+        applyStepPacing(type, ms);
         return;
       }
 
       if (res?.status === "wait") {
-        // Movement step; tickMovement() will shift when done.
         return;
       }
 
-      // done => shift
       bot._planQueue.shift();
 
       const ms = Date.now() - startedAt;
@@ -276,7 +233,6 @@ function attachEngine({ bot, persona, config }) {
         console.log(`[${bot.username}] [job] fail ${type || "UNKNOWN"} ms=${ms} reason=${reason}`);
       } catch {}
 
-      // Even on failures, pace a bit so failure loops don’t melt the event loop.
       applyStepPacing(type, ms);
 
       const parsed = parseInsufficientMaterial(reason);
@@ -290,6 +246,44 @@ function attachEngine({ bot, persona, config }) {
             ms,
             pos: stepPos,
             pos2: posObj(bot),
+          });
+          bot._planQueue = [...remediation.newQueue, ...bot._planQueue.slice(1)];
+          bot._current = null;
+          return;
+        }
+      }
+
+      const missingComponent = parseMissingBuildComponent(reason);
+      if (missingComponent && bot._current) {
+        const remediation = remediateMissingBuildComponent({ step: bot._current, parsed: missingComponent });
+        if (remediation?.ok && Array.isArray(remediation.newQueue) && remediation.newQueue.length) {
+          postEvent(bot.username, `${config.TEAM_PREFIX} recover ${type}: ${remediation.reason}`, "action_recover", {
+            type,
+            reason: remediation.reason,
+            err: reason,
+            ms,
+            pos: stepPos,
+            pos2: posObj(bot),
+            component: missingComponent.component,
+          });
+          bot._planQueue = [...remediation.newQueue, ...bot._planQueue.slice(1)];
+          bot._current = null;
+          return;
+        }
+      }
+
+      const noMaterial = parseNoPlaceableMaterial(reason);
+      if (noMaterial && bot._current) {
+        const remediation = remediateNoPlaceableMaterial({ step: bot._current, parsed: noMaterial });
+        if (remediation?.ok && Array.isArray(remediation.newQueue) && remediation.newQueue.length) {
+          postEvent(bot.username, `${config.TEAM_PREFIX} recover ${type}: ${remediation.reason}`, "action_recover", {
+            type,
+            reason: remediation.reason,
+            err: reason,
+            ms,
+            pos: stepPos,
+            pos2: posObj(bot),
+            buildKind: noMaterial.kind,
           });
           bot._planQueue = [...remediation.newQueue, ...bot._planQueue.slice(1)];
           bot._current = null;

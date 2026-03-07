@@ -6,10 +6,12 @@
 // - Prefer simple "best practice" shelter layouts: foundation, walls, doorway, windows, roof.
 // - Allow forts to optionally place interior utilities (bed, chest, crafting table, furnace).
 // - Keep build sites stable across retries/restarts.
+// - Fail with machine-readable errors so the planner can gather materials and retry.
 
 const { goals } = require("mineflayer-pathfinder");
 const GoalNear = goals.GoalNear;
 const vec3 = require("vec3");
+const mcDataLoader = require("minecraft-data");
 const { getBuildSite, setBuildSite } = require("./memory");
 
 function clampInt(n, lo, hi, fallback) {
@@ -62,10 +64,6 @@ function countMatchingItems(bot, names) {
     if (want.has(it.name)) total += it.count || 0;
   }
   return total;
-}
-
-function hasAnyMatchingItem(bot, names) {
-  return countMatchingItems(bot, names) > 0;
 }
 
 function findInventoryItem(bot, names) {
@@ -277,14 +275,13 @@ function rectRing(halfX, halfZ, y, push) {
 function blueprintFort(opts = {}) {
   const size = clampInt(opts.size, 9, 13, 9);
   const wallH = clampInt(opts.height, 4, 6, 4);
-  const towerH = clampInt(opts.towerHeight, wallH + 1, wallH + 3, wallH + 2);
+  const roofY = wallH + 1;
   const half = Math.floor(size / 2);
   const inner = Math.max(2, half - 1);
   const out = [];
   const seen = new Set();
   const push = (p) => pushUnique(seen, out, p);
 
-  // Foundation + floor.
   for (let x = -half; x <= half; x++) {
     for (let z = -half; z <= half; z++) {
       push(v(x, -1, z));
@@ -292,10 +289,8 @@ function blueprintFort(opts = {}) {
     }
   }
 
-  // Main walls.
   for (let y = 1; y <= wallH; y++) rectRing(half, half, y, push);
 
-  // Corner pillars/towers.
   const corners = [
     v(-half, 1, -half),
     v(-half, 1, half),
@@ -303,30 +298,18 @@ function blueprintFort(opts = {}) {
     v(half, 1, half),
   ];
   for (const c of corners) {
-    for (let y = 1; y <= towerH; y++) push(v(c.x, y, c.z));
+    for (let y = 1; y <= roofY; y++) push(v(c.x, y, c.z));
   }
 
-  // Battlements.
-  const battY = wallH + 1;
-  for (let x = -half; x <= half; x += 2) {
-    push(v(x, battY, -half));
-    push(v(x, battY, half));
-  }
-  for (let z = -half; z <= half; z += 2) {
-    push(v(-half, battY, z));
-    push(v(half, battY, z));
-  }
-
-  // Small roof over the keep interior so the structure reads as intentional.
-  for (let x = -inner; x <= inner; x++) {
-    for (let z = -inner; z <= inner; z++) {
-      if (Math.abs(x) === inner || Math.abs(z) === inner || (Math.abs(x) <= 1 && Math.abs(z) <= 1)) {
-        push(v(x, wallH + 1, z));
-      }
+  for (let x = -half; x <= half; x++) {
+    for (let z = -half; z <= half; z++) {
+      push(v(x, roofY, z));
     }
   }
 
-  // Doorway + arrow slit windows.
+  push(v(-1, wallH, -half));
+  push(v(1, wallH, -half));
+
   const open = new Set([
     keyOf(v(0, 1, -half)),
     keyOf(v(0, 2, -half)),
@@ -339,6 +322,10 @@ function blueprintFort(opts = {}) {
 
   return {
     blocks: removePositions(out, open),
+    door: {
+      bottom: v(0, 1, -half),
+      facingOutside: v(0, 1, -half - 1),
+    },
     utility: {
       anchor: v(0, 1, 0),
       bedHead: v(-inner + 1, 1, inner - 1),
@@ -347,7 +334,7 @@ function blueprintFort(opts = {}) {
       crafting: v(inner - 1, 1, -inner + 1),
       furnace: v(inner - 1, 1, -inner + 2),
     },
-    metadata: { size, wallH, towerH, footprint: size },
+    metadata: { size, wallH, roofY, footprint: size },
   };
 }
 
@@ -355,13 +342,13 @@ function blueprintHouse(opts = {}) {
   const width = clampInt(opts.width ?? opts.size, 7, 9, 7);
   const depth = clampInt(opts.depth ?? opts.size, 7, 9, 7);
   const wallH = clampInt(opts.height, 3, 4, 3);
+  const roofY = wallH + 1;
   const halfX = Math.floor(width / 2);
   const halfZ = Math.floor(depth / 2);
   const out = [];
   const seen = new Set();
   const push = (p) => pushUnique(seen, out, p);
 
-  // Foundation + floor.
   for (let x = -halfX; x <= halfX; x++) {
     for (let z = -halfZ; z <= halfZ; z++) {
       push(v(x, -1, z));
@@ -371,24 +358,14 @@ function blueprintHouse(opts = {}) {
 
   for (let y = 1; y <= wallH; y++) rectRing(halfX, halfZ, y, push);
 
-  // Simple gable-ish stepped roof.
-  let roofY = wallH + 1;
-  for (let inset = 0; inset <= Math.floor(Math.min(width, depth) / 4); inset++) {
-    for (let x = -halfX + inset; x <= halfX - inset; x++) {
-      push(v(x, roofY, -halfZ + inset));
-      push(v(x, roofY, halfZ - inset));
+  for (let x = -halfX; x <= halfX; x++) {
+    for (let z = -halfZ; z <= halfZ; z++) {
+      push(v(x, roofY, z));
     }
-    for (let z = -halfZ + inset; z <= halfZ - inset; z++) {
-      push(v(-halfX + inset, roofY, z));
-      push(v(halfX - inset, roofY, z));
-    }
-    roofY++;
   }
 
-  // Cap so the roof is closed.
-  for (let x = -1; x <= 1; x++) {
-    for (let z = -1; z <= 1; z++) push(v(x, roofY - 1, z));
-  }
+  push(v(-1, wallH, -halfZ));
+  push(v(1, wallH, -halfZ));
 
   const open = new Set([
     keyOf(v(0, 1, -halfZ)),
@@ -400,6 +377,10 @@ function blueprintHouse(opts = {}) {
 
   return {
     blocks: removePositions(out, open),
+    door: {
+      bottom: v(0, 1, -halfZ),
+      facingOutside: v(0, 1, -halfZ - 1),
+    },
     utility: {
       anchor: v(0, 1, 0),
       bedHead: v(-halfX + 1, 1, halfZ - 1),
@@ -408,7 +389,7 @@ function blueprintHouse(opts = {}) {
       crafting: v(halfX - 1, 1, -halfZ + 1),
       furnace: v(halfX - 1, 1, -halfZ + 2),
     },
-    metadata: { width, depth, wallH, footprint: Math.max(width, depth) },
+    metadata: { width, depth, wallH, roofY, footprint: Math.max(width, depth) },
   };
 }
 
@@ -426,6 +407,160 @@ function getStructurePlan(kind, params = {}) {
   const k = String(kind || params.kind || "FORT").toUpperCase();
   if (k === "HOUSE" || k === "HUT" || k === "CABIN") return blueprintHouse(params);
   return blueprintFort(params);
+}
+
+function preferredDoorNames(material) {
+  const m = String(material || "").toLowerCase();
+  const woods = ["oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "bamboo", "crimson", "warped"];
+  const preferred = [];
+  const wood = woods.find((w) => m.includes(w));
+  if (wood) preferred.push(`${wood}_door`);
+  preferred.push("oak_door", "spruce_door", "birch_door", "jungle_door", "acacia_door", "dark_oak_door");
+  return [...new Set(preferred)];
+}
+
+function preferredDoorPlankNames(material) {
+  return preferredDoorNames(material)
+    .map((name) => name.replace(/_door$/, "_planks"))
+    .filter(Boolean);
+}
+
+function preferredBuildMaterialsForKind(kind) {
+  const k = String(kind || "FORT").toUpperCase();
+  if (k === "HOUSE" || k === "HUT" || k === "CABIN") {
+    return ["oak_planks", "spruce_planks", "birch_planks", "cobblestone", "stone_bricks", "stone"];
+  }
+  return ["cobblestone", "stone_bricks", "cobbled_deepslate", "deepslate", "stone", "oak_planks"];
+}
+
+function selectBuildMaterial(bot, kind, requested) {
+  if (requested) return String(requested);
+  return chooseMaterialFromInventory(bot, preferredBuildMaterialsForKind(kind));
+}
+
+function requiredMaterialThreshold(blockCount, kind) {
+  const base = String(kind || "FORT").toUpperCase() === "FORT" ? 110 : 70;
+  return Math.max(base, Math.floor(blockCount * 0.62));
+}
+
+function doorMaterialState(bot, material) {
+  const doorNames = preferredDoorNames(material);
+  const doorPlanks = preferredDoorPlankNames(material);
+  const directDoorCount = countMatchingItems(bot, doorNames);
+  const plankCount = countMatchingItems(bot, doorPlanks);
+  const logCount = invItems(bot)
+    .filter((it) => /(_log|_stem|hyphae)$/i.test(it.name || ""))
+    .reduce((sum, it) => sum + (it.count || 0), 0);
+
+  return {
+    directDoorCount,
+    plankCount,
+    logCount,
+    hasCraftableDoor: directDoorCount > 0 || plankCount >= 6 || logCount > 0,
+    preferredDoorNames: doorNames,
+    preferredDoorPlanks: doorPlanks,
+  };
+}
+
+function assertBuildPreflight(bot, { kind, structurePlan, material }) {
+  const needBlocks = requiredMaterialThreshold(structurePlan.blocks.length, kind);
+  const haveBlocks = countMatchingItems(bot, [material]);
+  if (haveBlocks < needBlocks) {
+    throw new Error(`Insufficient ${material}: have ${haveBlocks}, need at least ${needBlocks}`);
+  }
+
+  const doorState = doorMaterialState(bot, material);
+  if (!doorState.hasCraftableDoor) {
+    throw new Error(`Missing build component: door reason=missing_materials`);
+  }
+
+  return { needBlocks, haveBlocks, doorState };
+}
+
+function findNearbyBlockByName(bot, blockName, maxDistance = 8) {
+  try {
+    return bot.findBlock({
+      matching: (b) => b && b.name === blockName,
+      maxDistance,
+      count: 1,
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function craftNamedItem(bot, mcData, itemName, count, craftingTableBlock) {
+  const item = mcData.itemsByName[itemName];
+  if (!item) return false;
+  try {
+    const recipes = bot.recipesFor(item.id, null, count, craftingTableBlock);
+    if (!recipes || !recipes.length) return false;
+    await bot.craft(recipes[0], count, craftingTableBlock);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureDoorItem(bot, material, origin) {
+  const names = preferredDoorNames(material);
+  const already = findInventoryItem(bot, names);
+  if (already) return already.name;
+
+  const mcData = mcDataLoader(bot.version);
+  let table = findNearbyBlockByName(bot, "crafting_table", 8);
+
+  if (!table) {
+    if (!findInventoryItem(bot, ["crafting_table"])) {
+      const craftedTable = await craftNamedItem(bot, mcData, "crafting_table", 1, null);
+      if (!craftedTable) return null;
+    }
+    try {
+      await equipNamedItem(bot, ["crafting_table"]);
+      const tablePos = add(origin, v(1, 1, 1));
+      await placeOne(bot, tablePos);
+      await sleep(150);
+      table = bot.blockAt(tablePos) || findNearbyBlockByName(bot, "crafting_table", 8);
+    } catch {}
+  }
+
+  if (!table) return null;
+
+  for (const name of names) {
+    const ok = await craftNamedItem(bot, mcData, name, 1, table);
+    if (ok) return name;
+  }
+
+  return null;
+}
+
+async function placeDoor(bot, origin, structurePlan, material) {
+  const door = structurePlan?.door;
+  if (!door?.bottom) return { ok: false, reason: "no_doorway" };
+
+  const bottom = add(origin, door.bottom);
+  const existingBottom = bot.blockAt(bottom);
+  if (existingBottom && existingBottom.name && existingBottom.name.endsWith("_door")) {
+    return { ok: true, reason: "already_present" };
+  }
+
+  const doorItem = await ensureDoorItem(bot, material, origin);
+  if (!doorItem) return { ok: false, reason: "missing_materials" };
+
+  try {
+    await equipNamedItem(bot, [doorItem]);
+    if (door.facingOutside) {
+      const lookAtPos = add(origin, door.facingOutside);
+      try {
+        await bot.lookAt(v(lookAtPos.x + 0.5, lookAtPos.y + 0.5, lookAtPos.z + 0.5), true);
+        await sleep(50);
+      } catch {}
+    }
+    const placed = await placeOne(bot, bottom);
+    return { ok: placed, reason: placed ? "placed" : "blocked" };
+  } catch {
+    return { ok: false, reason: "place_failed" };
+  }
 }
 
 function getUtilityOptions(params = {}) {
@@ -518,7 +653,6 @@ async function placeUtilities(bot, origin, structurePlan, params = {}) {
       "gray_bed", "light_gray_bed", "brown_bed", "purple_bed", "cyan_bed", "pink_bed",
       "orange_bed", "lime_bed", "light_blue_bed", "magenta_bed"
     ];
-    // Beds place relative to facing direction; look toward bed foot so the head extends inward.
     const bedHead = add(origin, util.bedHead);
     const bedFoot = add(origin, util.bedFoot);
     const lookAtPos = v(bedHead.x + 0.5, bedHead.y, bedHead.z + 0.5);
@@ -548,13 +682,7 @@ async function buildStructure(bot, params = {}) {
   const kind = String(params.kind || "FORT").toUpperCase();
   const structurePlan = getStructurePlan(kind, params);
 
-  const requested = params.material ? String(params.material) : null;
-  const preferredByKind =
-    kind === "HOUSE" || kind === "HUT" || kind === "CABIN"
-      ? ["oak_planks", "spruce_planks", "birch_planks", "cobblestone", "stone_bricks", "stone"]
-      : ["cobblestone", "stone_bricks", "cobbled_deepslate", "deepslate", "stone", "oak_planks"];
-
-  const material = requested || chooseMaterialFromInventory(bot, preferredByKind);
+  const material = selectBuildMaterial(bot, kind, params.material);
   if (!material) throw new Error(`No placeable material found for ${kind.toLowerCase()}`);
 
   const footprint = clampInt(structurePlan?.metadata?.footprint, 7, 15, 9);
@@ -563,14 +691,21 @@ async function buildStructure(bot, params = {}) {
     ? v(params.origin.x, params.origin.y, params.origin.z)
     : resolveBuildOrigin(bot, siteKey, footprint);
 
-  const minRequiredBlocks = Math.max(kind === "FORT" ? 110 : 70, Math.floor(structurePlan.blocks.length * 0.62));
+  const minRequiredBlocks = requiredMaterialThreshold(structurePlan.blocks.length, kind);
+  assertBuildPreflight(bot, { kind, structurePlan, material });
+
   const buildRes = await runBlueprint(bot, origin, structurePlan.blocks, material, {
-    minComplete: kind === "FORT" ? 0.82 : 0.8,
+    minComplete: kind === "FORT" ? 0.9 : 0.88,
     minRequiredBlocks,
   });
 
+  const door = await placeDoor(bot, origin, structurePlan, material);
+  if (!door.ok) {
+    throw new Error(`Missing build component: door reason=${door.reason}`);
+  }
+
   const utilities = await placeUtilities(bot, origin, structurePlan, params);
-  return { ...buildRes, kind, material, utilities };
+  return { ...buildRes, kind, material, door, utilities };
 }
 
 async function buildFort(bot, params = {}) {

@@ -1,17 +1,22 @@
 {
   "schema_version": 1,
-  "saved_at": "2026-03-07T06:45:25.128Z",
+  "saved_at": "2026-03-07T22:36:08.629Z",
   "hostname": "ip-172-31-32-164",
   "username": "ScoutSasha",
-  "say": "Okay — returning to base to craft tools; standing by.",
-  "intent": "Acknowledge and return to base to craft tools.",
+  "say": "Beginning construction of a 9×9 cobblestone fort with bed, storage, crafting, and furnace.",
+  "intent": "Build a cobblestone fort with basics.",
   "trigger": "human_deferred",
   "plan": [
     {
-      "type": "RETURN_BASE"
-    },
-    {
-      "type": "CRAFT_TOOLS"
+      "type": "BUILD_STRUCTURE",
+      "kind": "FORT",
+      "size": 9,
+      "height": 4,
+      "material": "cobblestone",
+      "includeBed": true,
+      "includeStorage": true,
+      "includeCrafting": true,
+      "includeFurnace": true
     }
   ]
 }

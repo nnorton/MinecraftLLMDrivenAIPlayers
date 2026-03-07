@@ -58,6 +58,35 @@ function parseInsufficientMaterial(errMsg) {
   };
 }
 
+function parseMissingBuildComponent(errMsg) {
+  const msg = String(errMsg || "");
+
+  let m = msg.match(/Missing\s+build\s+component:\s*([a-z0-9_]+)\s*(?:reason=([a-z0-9_:-]+))?/i);
+  if (m) {
+    return {
+      component: String(m[1] || "").toLowerCase(),
+      reason: String(m[2] || "").toLowerCase() || null,
+    };
+  }
+
+  m = msg.match(/Build\s+incomplete:\s*could\s+not\s+place\s+door\s*\(([^)]+)\)/i);
+  if (m) {
+    return {
+      component: "door",
+      reason: String(m[1] || "").toLowerCase(),
+    };
+  }
+
+  return null;
+}
+
+function parseNoPlaceableMaterial(errMsg) {
+  const msg = String(errMsg || "");
+  const m = msg.match(/No\s+placeable\s+material\s+found\s+for\s+([a-z0-9_]+)/i);
+  if (!m) return null;
+  return { kind: String(m[1] || "").toLowerCase() };
+}
+
 function parseBuildIncomplete(errMsg) {
   const msg = String(errMsg || "");
   const m = msg.match(
@@ -86,6 +115,8 @@ module.exports = {
   isPathfinderPlanningError,
   isMajorStepType,
   parseInsufficientMaterial,
+  parseMissingBuildComponent,
+  parseNoPlaceableMaterial,
   parseBuildIncomplete,
   posObj,
 };
