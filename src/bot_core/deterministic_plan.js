@@ -4,6 +4,27 @@ const { pickNextTask } = require("../task_picker");
 
 function deterministicPlan(bot, humanMessage) {
   const msg = String(humanMessage || "").toLowerCase();
+  const wantsUtilities =
+    msg.includes("bed") || msg.includes("storage") || msg.includes("chest") || msg.includes("crafting") || msg.includes("furnace");
+
+  if (msg.includes("house") || msg.includes("hut") || msg.includes("cabin") || msg.includes("shelter") || msg.includes("base")) {
+    return [
+      { type: "SAY", text: "Understood — I’ll build a compact shelter with a realistic layout." },
+      { type: "CRAFT_TOOLS" },
+      { type: "GATHER_WOOD", count: 16, radius: 64 },
+      {
+        type: "BUILD_STRUCTURE",
+        kind: "HOUSE",
+        size: 7,
+        height: 3,
+        material: "oak_planks",
+        includeBed: wantsUtilities,
+        includeStorage: wantsUtilities,
+        includeCrafting: wantsUtilities,
+        includeFurnace: wantsUtilities,
+      },
+    ];
+  }
 
   if (
     msg.includes("fort") ||
@@ -12,10 +33,20 @@ function deterministicPlan(bot, humanMessage) {
     msg.includes("castle")
   ) {
     return [
-      { type: "SAY", text: "Understood — I’ll build a proper fort and keep working until it’s done." },
+      { type: "SAY", text: wantsUtilities ? "Understood — I’ll build a proper fort with useful interior blocks." : "Understood — I’ll build a proper fort and keep working until it’s done." },
       { type: "CRAFT_TOOLS" },
       { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 32, radius: 48 },
-      { type: "BUILD_STRUCTURE", kind: "FORT", size: 9, height: 4, material: "cobblestone" },
+      {
+        type: "BUILD_STRUCTURE",
+        kind: "FORT",
+        size: 9,
+        height: 4,
+        material: "cobblestone",
+        includeBed: wantsUtilities,
+        includeStorage: wantsUtilities,
+        includeCrafting: wantsUtilities,
+        includeFurnace: wantsUtilities,
+      },
     ];
   }
 

@@ -21,18 +21,51 @@ function chooseHelpfulPlanNonLLM({ bot, humanMessage }) {
   ]);
   const hasAxe = hasAnyTool(counts, ["wooden_axe", "stone_axe", "iron_axe", "diamond_axe"]);
 
-  if (msg.includes("fort") || msg.includes("wall") || msg.includes("defense") || msg.includes("build")) {
-    // Deterministic fort attempt; recovery logic in bot engine will mine when insufficient.
+  const wantsShelter =
+    msg.includes("house") || msg.includes("hut") || msg.includes("cabin") || msg.includes("shelter") || msg.includes("base");
+  const wantsFort = msg.includes("fort") || msg.includes("wall") || msg.includes("defense") || msg.includes("build");
+  const wantsUtilities =
+    msg.includes("bed") || msg.includes("storage") || msg.includes("chest") || msg.includes("crafting") || msg.includes("furnace");
+
+  if (wantsShelter || wantsFort) {
     if (!hasPick) {
       return [
-        { type: "SAY", text: "I’ll craft tools, mine stone, then build a proper fort." },
+        { type: "SAY", text: "I’ll craft tools, gather materials, and build a proper shelter." },
         { type: "CRAFT_TOOLS" },
         { type: "MINE_BLOCKS", targets: ["stone", "coal_ore"], count: 32, radius: 48 },
       ];
     }
+
+    if (wantsShelter && !wantsFort) {
+      return [
+        { type: "SAY", text: "Building a compact shelter with a real roof and useful interior." },
+        {
+          type: "BUILD_STRUCTURE",
+          kind: "HOUSE",
+          size: 7,
+          height: 3,
+          material: counts.oak_planks ? "oak_planks" : "cobblestone",
+          includeBed: wantsUtilities,
+          includeStorage: wantsUtilities,
+          includeCrafting: wantsUtilities,
+          includeFurnace: wantsUtilities,
+        },
+      ];
+    }
+
     return [
-      { type: "SAY", text: "Building a recognizable fort (9x9, 4-high walls) using cobblestone." },
-      { type: "BUILD_STRUCTURE", kind: "FORT", size: 9, height: 4, material: "cobblestone" },
+      { type: "SAY", text: wantsUtilities ? "Building a proper fort with useful interior blocks." : "Building a proper fort with full walls and a real layout." },
+      {
+        type: "BUILD_STRUCTURE",
+        kind: "FORT",
+        size: 9,
+        height: 4,
+        material: "cobblestone",
+        includeBed: wantsUtilities,
+        includeStorage: wantsUtilities,
+        includeCrafting: wantsUtilities,
+        includeFurnace: wantsUtilities,
+      },
     ];
   }
 

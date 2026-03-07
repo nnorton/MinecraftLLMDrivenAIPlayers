@@ -53,7 +53,6 @@ function stockpileBuildingBlocksTask(bot, counts) {
 }
 
 function generalProductiveTask(bot, counts) {
-  // If hungry, try farming/food gathering (simple heuristic)
   if (bot.food != null && bot.food <= 10) {
     if (!hasAxe(counts)) return { type: "GATHER_WOOD", count: 12 };
 
@@ -61,20 +60,13 @@ function generalProductiveTask(bot, counts) {
       return { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 };
     }
 
-    // FARM is on cooldown: do something else to avoid idle/tight loops.
     return { type: "MINE_BLOCKS", targets: ["coal_ore", "stone"], count: 10 };
   }
 
-  // tools first
   if (!hasPickaxe(counts) || !hasAxe(counts)) return { type: "CRAFT_TOOLS" };
-
-  // mine resources
   if ((counts.iron_ore || 0) < 12) return { type: "MINE_BLOCKS", targets: ["iron_ore", "coal_ore", "stone"], count: 18 };
-
-  // smelt if we have ore
   if ((counts.iron_ore || 0) >= 10 && (counts.furnace || 0) > 0) return { type: "SMELT_ORE" };
 
-  // default: mine/build
   return { type: "MINE_BLOCKS", targets: ["coal_ore", "iron_ore", "stone"], count: 14 };
 }
 
@@ -88,12 +80,21 @@ function pickNextTask(bot) {
     return stockpileBuildingBlocksTask(bot, counts);
   }
 
-  // Occasionally do something fun
   const okToDoExtras = hasPickaxe(counts) && (bot.food == null || bot.food > 10);
   if (okToDoExtras && Math.random() < 0.08) {
     return randChoice(
       [
         canDo(bot, "FARM") ? { type: "FARM", crops: ["wheat", "carrots", "potatoes"], max: 10, size: 5 } : null,
+        {
+          type: "BUILD_STRUCTURE",
+          kind: "HOUSE",
+          size: 7,
+          height: 3,
+          material: counts.oak_planks ? "oak_planks" : "cobblestone",
+          includeBed: true,
+          includeStorage: true,
+          includeCrafting: true,
+        },
         { type: "BUILD_MONUMENT", height: 11, material: "stone_bricks" },
       ].filter(Boolean)
     );
@@ -104,10 +105,18 @@ function pickNextTask(bot) {
 
 function deterministicPlan(bot, message) {
   const m = String(message || "").toLowerCase();
+  const wantsUtilities =
+    m.includes("bed") || m.includes("storage") || m.includes("chest") || m.includes("crafting") || m.includes("furnace");
+
   if (m.includes("wood")) return [{ type: "GATHER_WOOD", count: 16 }];
   if (m.includes("mine") || m.includes("iron") || m.includes("coal"))
     return [{ type: "MINE_BLOCKS", targets: ["iron_ore", "coal_ore", "stone"], count: 18 }];
-  if (m.includes("build") || m.includes("fort")) return [{ type: "BUILD_STRUCTURE", kind: "FORT", size: 9, height: 4 }];
+  if (m.includes("house") || m.includes("hut") || m.includes("cabin") || m.includes("shelter") || m.includes("base")) {
+    return [{ type: "BUILD_STRUCTURE", kind: "HOUSE", size: 7, height: 3, includeBed: wantsUtilities, includeStorage: wantsUtilities, includeCrafting: wantsUtilities, includeFurnace: wantsUtilities }];
+  }
+  if (m.includes("build") || m.includes("fort")) {
+    return [{ type: "BUILD_STRUCTURE", kind: "FORT", size: 9, height: 4, includeBed: wantsUtilities, includeStorage: wantsUtilities, includeCrafting: wantsUtilities, includeFurnace: wantsUtilities }];
+  }
   return [pickNextTask(bot)];
 }
 
