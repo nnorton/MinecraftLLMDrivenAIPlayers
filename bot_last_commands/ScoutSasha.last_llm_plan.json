@@ -1,18 +1,18 @@
 {
   "schema_version": 1,
-  "saved_at": "2026-03-05T06:16:42.502Z",
+  "saved_at": "2026-03-07T00:41:00.963Z",
   "hostname": "ip-172-31-32-164",
   "username": "ScoutSasha",
-  "say": "Noted — I'll wander to find trees and then gather wood.",
-  "intent": "I'll search for nearby trees and collect wood.",
+  "say": "Starting construction of a 9x9 cobblestone fort (height 4).",
+  "intent": "I'll build a cobblestone fort now.",
   "trigger": "human_deferred",
   "plan": [
     {
-      "type": "WANDER"
-    },
-    {
-      "type": "GATHER_WOOD",
-      "count": 8
+      "type": "BUILD_STRUCTURE",
+      "kind": "FORT",
+      "size": 9,
+      "height": 4,
+      "material": "cobblestone"
     }
   ]
 }

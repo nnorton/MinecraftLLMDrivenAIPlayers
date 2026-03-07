@@ -1,14 +1,22 @@
 // src/actions/gather.js
 const mcDataLoader = require("minecraft-data");
 const { Vec3 } = require("vec3");
+const { goals } = require("mineflayer-pathfinder");
 const { ensureBestToolForBlock } = require("../utils/tools");
 
 const DEFAULT_SEARCH_RADIUS = parseInt(process.env.SEARCH_RADIUS || "32", 10);
 const MAX_SEARCH_RADIUS = parseInt(process.env.SEARCH_RADIUS_MAX || "96", 10);
-const EXPAND_SEARCH_STEPS = parseInt(process.env.SEARCH_RADIUS_EXPAND_STEPS || "3", 10); // how many radius expansions to try
+const EXPAND_SEARCH_STEPS = parseInt(process.env.SEARCH_RADIUS_EXPAND_STEPS || "3", 10);
 
-const COLLECT_BLOCK_TIMEOUT_MS = parseInt(process.env.COLLECT_BLOCK_TIMEOUT_MS || "20000", 10);
+const COLLECT_BLOCK_TIMEOUT_MS = parseInt(process.env.COLLECT_BLOCK_TIMEOUT_MS || "12000", 10);
 const COLLECT_BATCH_TIMEOUT_MS = parseInt(process.env.COLLECT_BATCH_TIMEOUT_MS || "90000", 10);
+const MOVE_TO_BLOCK_TIMEOUT_MS = parseInt(process.env.MOVE_TO_BLOCK_TIMEOUT_MS || "10000", 10);
+const LOOK_STUCK_TIMEOUT_MS = parseInt(process.env.LOOK_STUCK_TIMEOUT_MS || "3500", 10);
+const DIG_RETRY_LIMIT = parseInt(process.env.DIG_RETRY_LIMIT || "2", 10);
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function withTimeout(promise, ms, onTimeout) {
   const timeoutMs = Math.max(0, parseInt(ms, 10) || 0);
@@ -52,7 +60,7 @@ function clamp(n, lo, hi) {
 }
 
 async function yieldEvery(i, every = 12, delayMs = 10) {
-  if (i % every === 0) await new Promise((r) => setTimeout(r, delayMs));
+  if (i % every === 0) await sleep(delayMs);
 }
 
 function logInfo(bot, msg) {
@@ -75,11 +83,52 @@ function isPathfinderPlanningError(msg) {
   );
 }
 
-// --- Core "best effort" mining/collect helpers ---
+function distanceToBlock(bot, block) {
+  if (!bot?.entity?.position || !block?.position) return Infinity;
+  return bot.entity.position.distanceTo(block.position);
+}
+
+function hasAdjacentAir(bot, pos) {
+  const offsets = [
+    new Vec3(1, 0, 0),
+    new Vec3(-1, 0, 0),
+    new Vec3(0, 0, 1),
+    new Vec3(0, 0, -1),
+    new Vec3(0, 1, 0),
+  ];
+  for (const off of offsets) {
+    const b = bot.blockAt(pos.plus(off));
+    if (!b || b.name === "air" || b.boundingBox === "empty") return true;
+  }
+  return false;
+}
+
+function isLikelyLogName(name = "") {
+  return /(_log|_stem|hyphae)$/i.test(String(name || ""));
+}
+
+function isStillTargetBlock(block, desiredNames) {
+  if (!block) return false;
+  return desiredNames.includes(String(block.name || "").toLowerCase());
+}
+
+function scoreTarget(bot, block, desiredNames) {
+  if (!block || !isStillTargetBlock(block, desiredNames)) return Number.POSITIVE_INFINITY;
+  let score = distanceToBlock(bot, block);
+
+  if (!hasAdjacentAir(bot, block.position)) score += 8;
+  if (isLikelyLogName(block.name)) {
+    const above = bot.blockAt(block.position.offset(0, 1, 0));
+    if (above && above.name === block.name) score += 2;
+  }
+
+  return score;
+}
 
 function findBlocksByNames(bot, names, max = 64, radius = DEFAULT_SEARCH_RADIUS) {
   const mcData = mcDataLoader(bot.version);
-  const ids = names.map((n) => mcData.blocksByName[n]?.id).filter(Boolean);
+  const desiredNames = names.map((n) => String(n || "").toLowerCase());
+  const ids = desiredNames.map((n) => mcData.blocksByName[n]?.id).filter(Boolean);
   if (!ids.length) return [];
 
   const positions = bot.findBlocks({
@@ -88,59 +137,146 @@ function findBlocksByNames(bot, names, max = 64, radius = DEFAULT_SEARCH_RADIUS)
     count: max,
   });
 
-  return (positions || []).map((p) => new Vec3(p.x, p.y, p.z));
+  const blocks = (positions || [])
+    .map((p) => bot.blockAt(new Vec3(p.x, p.y, p.z)))
+    .filter(Boolean)
+    .sort((a, b) => scoreTarget(bot, a, desiredNames) - scoreTarget(bot, b, desiredNames));
+
+  const seen = new Set();
+  return blocks.filter((b) => {
+    const key = `${b.position.x},${b.position.y},${b.position.z}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
-async function bestEffortCollect(bot, blockPositions, count) {
-  if (!blockPositions?.length) return 0;
-  const toCollect = blockPositions.slice(0, Math.min(blockPositions.length, count));
-  const collected = [];
+async function waitUntilNearBlock(bot, block, timeoutMs = MOVE_TO_BLOCK_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  let lastPosKey = null;
+  let stableSince = Date.now();
 
-  for (let i = 0; i < toCollect.length; i++) {
-    const pos = toCollect[i];
-    await yieldEvery(i, 10, 10);
+  while (Date.now() - startedAt < timeoutMs) {
+    const fresh = bot.blockAt(block.position);
+    if (!fresh || fresh.name === "air") return fresh;
 
+    const dist = distanceToBlock(bot, fresh);
+    if (dist <= 4.6) return fresh;
+
+    const pos = bot?.entity?.position;
+    const posKey = pos ? `${Math.round(pos.x * 10)},${Math.round(pos.y * 10)},${Math.round(pos.z * 10)}` : "none";
+    if (posKey !== lastPosKey) {
+      lastPosKey = posKey;
+      stableSince = Date.now();
+    }
+
+    const goalName = bot?.pathfinder?.goal?.constructor?.name || "";
+    const moving = (() => {
+      try {
+        return !!bot.pathfinder?.isMoving?.();
+      } catch {
+        return false;
+      }
+    })();
+
+    if (goalName === "GoalLookAtBlock" && !moving && Date.now() - stableSince >= LOOK_STUCK_TIMEOUT_MS) {
+      throw new Error(`stuck_looking_at_block:${fresh.name}`);
+    }
+
+    await sleep(150);
+  }
+
+  throw new Error(`move_to_block_timeout:${block.name}`);
+}
+
+async function manualCollectBlock(bot, originalBlock) {
+  let block = bot.blockAt(originalBlock.position);
+  if (!block || block.name === "air") return 0;
+
+  await ensureBestToolForBlock(bot, block);
+
+  bot.pathfinder?.setGoal?.(new goals.GoalNear(block.position.x, block.position.y, block.position.z, 1), false);
+  block = await waitUntilNearBlock(bot, block, MOVE_TO_BLOCK_TIMEOUT_MS);
+  if (!block || block.name === "air") return 1;
+
+  await ensureBestToolForBlock(bot, block);
+
+  try {
+    await bot.lookAt(block.position.offset(0.5, 0.5, 0.5), true);
+  } catch {}
+
+  const beforeName = block.name;
+
+  await withTimeout(
+    bot.dig(block, true),
+    COLLECT_BLOCK_TIMEOUT_MS,
+    () => cleanupCollect(bot)
+  );
+
+  await sleep(250);
+  const after = bot.blockAt(block.position);
+  return !after || after.name === "air" || after.name !== beforeName ? 1 : 0;
+}
+
+async function collectOneBlock(bot, block, desiredNames) {
+  const fresh = bot.blockAt(block.position);
+  if (!fresh || fresh.name === "air") return 0;
+  if (!isStillTargetBlock(fresh, desiredNames)) return 0;
+
+  for (let attempt = 1; attempt <= DIG_RETRY_LIMIT; attempt++) {
     try {
-      const b = bot.blockAt(pos);
-      if (!b) continue;
-
-      await ensureBestToolForBlock(bot, b);
-
-      await withTimeout(
-        bot.collectBlock.collect(b),
-        COLLECT_BLOCK_TIMEOUT_MS,
-        () => cleanupCollect(bot)
-      );
-
-      collected.push(pos);
+      const got = await manualCollectBlock(bot, fresh);
+      if (got > 0) return got;
     } catch (e) {
       const msg = shortErr(e);
-      if (isPathfinderPlanningError(msg)) continue;
-      continue;
+      cleanupCollect(bot);
+
+      if (msg.includes("stuck_looking_at_block") || msg.includes("move_to_block_timeout")) {
+        try {
+          bot.pathfinder?.setGoal?.(null);
+        } catch {}
+        if (attempt < DIG_RETRY_LIMIT) {
+          await sleep(250);
+          continue;
+        }
+      }
+
+      if (isPathfinderPlanningError(msg) && attempt < DIG_RETRY_LIMIT) {
+        await sleep(250);
+        continue;
+      }
+
+      if (attempt >= DIG_RETRY_LIMIT) {
+        logInfo(bot, `skip target ${fresh.name} @ ${fresh.position.x},${fresh.position.y},${fresh.position.z} reason=${msg}`);
+      }
     }
   }
 
-  return collected.length;
+  return 0;
 }
 
-async function collectPositions(bot, positions, count) {
-  const batchSize = 6;
+async function collectPositions(bot, blocks, count, desiredNames) {
   let collected = 0;
 
-  for (let i = 0; i < positions.length && collected < count; i += batchSize) {
-    const batch = positions.slice(i, i + batchSize);
-    const need = count - collected;
+  for (let i = 0; i < blocks.length && collected < count; i++) {
+    await yieldEvery(i, 10, 15);
 
     const got = await withTimeout(
-      bestEffortCollect(bot, batch, need),
-      COLLECT_BATCH_TIMEOUT_MS,
+      collectOneBlock(bot, blocks[i], desiredNames),
+      COLLECT_BLOCK_TIMEOUT_MS + MOVE_TO_BLOCK_TIMEOUT_MS + 1000,
       () => cleanupCollect(bot)
-    );
+    ).catch((e) => {
+      const msg = shortErr(e);
+      if (!isPathfinderPlanningError(msg)) {
+        logInfo(bot, `collectPositions timeout/fail reason=${msg}`);
+      }
+      return 0;
+    });
 
     collected += got;
-    await yieldEvery(i, 12, 15);
   }
 
+  cleanupCollect(bot);
   return collected;
 }
 
@@ -157,27 +293,39 @@ async function mineTargets(bot, targets = ["coal_ore", "iron_ore", "stone"], cou
     return 0;
   }
 
-  // Gradually expand radius if needed
   let r = radius ?? DEFAULT_SEARCH_RADIUS;
   r = clamp(parseInt(r, 10) || DEFAULT_SEARCH_RADIUS, 8, MAX_SEARCH_RADIUS);
 
+  const expandBy = Math.max(8, Math.round((MAX_SEARCH_RADIUS - r) / Math.max(1, EXPAND_SEARCH_STEPS)));
+
   for (let step = 0; step < EXPAND_SEARCH_STEPS; step++) {
-    const positions = findBlocksByNames(bot, desired, Math.min(count * 3, 96), r);
-    if (positions.length) {
-      const got = await collectPositions(bot, positions, count);
+    const blocks = findBlocksByNames(bot, desired, Math.min(count * 4, 96), r);
+    if (blocks.length) {
+      const got = await withTimeout(
+        collectPositions(bot, blocks, count, desired),
+        COLLECT_BATCH_TIMEOUT_MS,
+        () => cleanupCollect(bot)
+      ).catch((e) => {
+        logInfo(bot, `mineTargets batch fail targets=[${desired.join(",")}] reason=${shortErr(e)}`);
+        return 0;
+      });
+
       if (got > 0) return got;
     }
-    r = clamp(r + Math.round((MAX_SEARCH_RADIUS - (radius ?? DEFAULT_SEARCH_RADIUS)) / EXPAND_SEARCH_STEPS), 8, MAX_SEARCH_RADIUS);
+    r = clamp(r + expandBy, 8, MAX_SEARCH_RADIUS);
   }
 
-  logInfo(bot, `mineTargets: found 0 blocks for [${desired.join(",")}] within r<=${r}`);
+  logInfo(bot, `mineTargets: found 0 collectible blocks for [${desired.join(",")}] within r<=${r}`);
   return 0;
 }
 
-// --- Existing gather convenience wrappers ---
-
 async function gatherWood(bot, count = 8, radius = 64) {
-  return mineTargets(bot, ["oak_log", "spruce_log", "birch_log", "jungle_log", "acacia_log", "dark_oak_log"], count, radius);
+  return mineTargets(
+    bot,
+    ["oak_log", "spruce_log", "birch_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log"],
+    count,
+    radius
+  );
 }
 
 async function gatherStone(bot, count = 16, radius = 64) {
@@ -193,16 +341,12 @@ async function gatherIron(bot, count = 8, radius = 64) {
 }
 
 async function gatherFood(bot, count = 6, radius = 64) {
-  // Best-effort: berries / animals aren’t blocks; this is placeholder “food-ish” logic.
-  // If you have a better hunting/food action elsewhere, use it.
   return mineTargets(bot, ["hay_block", "melon", "pumpkin"], count, radius);
 }
 
 async function gatherCrops(bot, count = 8, radius = 64) {
   return mineTargets(bot, ["wheat", "carrots", "potatoes", "beetroots"], count, radius);
 }
-
-// --- Farming: harvest + replant (best effort) ---
 
 async function farmHarvestReplant(bot, crops = ["wheat", "carrots", "potatoes"], max = 12, radius = DEFAULT_SEARCH_RADIUS) {
   const mcData = mcDataLoader(bot.version);
@@ -215,25 +359,19 @@ async function farmHarvestReplant(bot, crops = ["wheat", "carrots", "potatoes"],
     return 0;
   }
 
-  const positions = findBlocksByNames(bot, wanted, Math.min(max * 3, 96), radius);
-  if (!positions.length) return 0;
+  const blocks = findBlocksByNames(bot, wanted, Math.min(max * 3, 96), radius);
+  if (!blocks.length) return 0;
 
-  // For simplicity, we just “collect” the crop blocks (mineflayer-collectblock handles approach/dig).
-  // True replanting requires seed selection + placing; that logic lives in src/actions/farm.js in your repo.
-  const got = await collectPositions(bot, positions, max);
-  return got;
+  return collectPositions(bot, blocks, max, wanted);
 }
 
 module.exports = {
-  // existing exports
   gatherWood,
   gatherStone,
   gatherCoal,
   gatherIron,
   gatherFood,
   gatherCrops,
-
-  // required by step_executor.js
   mineTargets,
   farmHarvestReplant,
 };
