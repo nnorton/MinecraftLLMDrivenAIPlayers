@@ -2,12 +2,120 @@
 
 const { recentEvents, recentFailuresFor } = require("../team_bus");
 const { drainMessages } = require("../inbox");
-const { summarizeInventory } = require("./utils");
+const { loadMemory, getWorldSummary } = require("../actions/memory");
+const { summarizeInventory, inventoryCounts, hasAnyTool } = require("./utils");
+
+function hasAnyStructureOfKind(mem, kinds) {
+  const want = new Set((Array.isArray(kinds) ? kinds : [kinds]).map((k) => String(k).toUpperCase()));
+  return (mem.structures || []).some((s) => want.has(String(s?.kind || "").toUpperCase()));
+}
+
+function structureUtilities(mem) {
+  const set = new Set();
+  for (const s of mem.structures || []) {
+    for (const u of Array.isArray(s.utilities) ? s.utilities : []) {
+      set.add(String(u).toLowerCase());
+    }
+  }
+  return set;
+}
+
+function countByNamePrefix(counts, needle) {
+  return Object.entries(counts || {})
+    .filter(([name]) => String(name).includes(needle))
+    .reduce((sum, [, n]) => sum + (n || 0), 0);
+}
+
+function cropItemCount(counts) {
+  const names = ["wheat", "carrot", "carrots", "potato", "potatoes", "beetroot"];
+  let total = 0;
+  for (const n of names) total += counts[n] || 0;
+  return total;
+}
+
+function seedItemCount(counts) {
+  return (counts.wheat_seeds || 0) + (counts.beetroot_seeds || 0);
+}
+
+function buildResourceGapAnalysis(bot) {
+  const mem = loadMemory(bot.username);
+  const counts = inventoryCounts(bot);
+  const gaps = [];
+
+  const hasBase =
+    !!mem.base ||
+    hasAnyStructureOfKind(mem, ["FORT", "HOUSE", "HUT", "CABIN", "BASE", "SHELTER"]);
+
+  const utilSet = structureUtilities(mem);
+  const hasKnownFarm = Array.isArray(mem.farms) && mem.farms.length > 0;
+  const hasStorage = !!mem.storage?.chest || utilSet.has("storage") || (counts.chest || 0) > 0;
+  const hasCrafting = utilSet.has("crafting") || (counts.crafting_table || 0) > 0;
+  const hasFurnace = utilSet.has("furnace") || (counts.furnace || 0) > 0;
+  const hasBed = utilSet.has("bed") || countByNamePrefix(counts, "_bed") > 0;
+
+  const woodTotal =
+    countByNamePrefix(counts, "_log") +
+    countByNamePrefix(counts, "_planks") +
+    (counts.stick || 0);
+
+  const stoneTotal =
+    (counts.cobblestone || 0) +
+    (counts.stone || 0) +
+    (counts.stone_bricks || 0) +
+    (counts.deepslate || 0) +
+    (counts.cobbled_deepslate || 0);
+
+  const fuelTotal = (counts.coal || 0) + (counts.charcoal || 0);
+  const oreTotal = (counts.iron_ore || 0) + (counts.raw_iron || 0);
+  const foodTotal = cropItemCount(counts) + (counts.bread || 0);
+  const seedTotal = seedItemCount(counts);
+
+  const hasWoodTool = hasAnyTool(counts, [
+    "wooden_axe",
+    "stone_axe",
+    "iron_axe",
+    "golden_axe",
+    "diamond_axe",
+    "netherite_axe",
+  ]);
+
+  const hasPickaxe = hasAnyTool(counts, [
+    "wooden_pickaxe",
+    "stone_pickaxe",
+    "iron_pickaxe",
+    "golden_pickaxe",
+    "diamond_pickaxe",
+    "netherite_pickaxe",
+  ]);
+
+  if (hasBase && !hasStorage) gaps.push("Has a base/shelter but lacks storage. Prefer adding chest/storage before making another base.");
+  if (hasBase && !hasCrafting) gaps.push("Has a base/shelter but lacks a crafting table nearby. Prefer adding crafting utility.");
+  if (hasBase && !hasFurnace && (oreTotal > 0 || fuelTotal > 0)) {
+    gaps.push("Has a base and some smelting inputs but lacks furnace utility. Prefer adding furnace or smelting.");
+  }
+  if (hasBase && !hasBed) gaps.push("Has a base/shelter but no known bed. Prefer adding a bed instead of building a new base.");
+  if (hasKnownFarm && foodTotal < 10) gaps.push("Has a farm but food stores seem low. Prefer harvest/replant or gather food.");
+  if (hasKnownFarm && seedTotal < 3) gaps.push("Has a farm but seed supply is low. Prefer harvesting grass/wheat and replanting carefully.");
+  if (!hasKnownFarm && hasBase && foodTotal < 8) gaps.push("Has a base but no known farm and food seems low. A small farm is reasonable if seeds/crops are available.");
+  if (woodTotal < 12) gaps.push("Wood supply looks low. Prefer gathering wood before any large structure expansion.");
+  if (stoneTotal < 24 && !hasBase) gaps.push("Building materials are limited for a strong shelter. Prefer mining stone/cobblestone before a fort.");
+  if (fuelTotal <= 1 && (oreTotal > 0 || hasFurnace)) gaps.push("Fuel is low for smelting. Prefer mining coal or making charcoal.");
+  if (!hasWoodTool) gaps.push("No axe detected. Prefer crafting tools before major wood gathering or construction.");
+  if (!hasPickaxe) gaps.push("No pickaxe detected. Prefer crafting tools before mining stone/ore.");
+
+  if (hasBase && hasKnownFarm && hasStorage && hasCrafting && hasFurnace && hasBed) {
+    gaps.push("Core infrastructure already exists. Prefer productive next steps like harvesting, mining, smelting, stockpiling, exploration, or improving utilities instead of rebuilding basics.");
+  }
+
+  return gaps.slice(0, 8);
+}
 
 function buildMenuPrompt({ bot, humanMessage }) {
   const pos = bot.entity?.position;
   const isNight = bot.time?.isNight ?? false;
   const invSummary = summarizeInventory(bot);
+  const worldSummary = getWorldSummary(bot);
+  const resourceGaps = buildResourceGapAnalysis(bot);
 
   const menu = [
     `Return ONLY valid JSON. No extra text.`,
@@ -15,6 +123,13 @@ function buildMenuPrompt({ bot, humanMessage }) {
     ``,
     `You must produce a realistic, helpful response and a plan.`,
     `If a human asked you to do something specific, DO NOT ignore it.`,
+    ``,
+    `LONG-TERM WORLD CONTEXT RULES:`,
+    `- Treat the persistent world summary and resource gap analysis below as source-of-truth for what you have already built or established.`,
+    `- Do NOT keep proposing new bases/forts/houses if you already have a usable base unless a human explicitly asked for another one or the current one clearly lacks key utilities.`,
+    `- If you already have a farm, prefer harvesting, replanting, mining, gathering, smelting, stockpiling, or improving utilities instead of making another farm.`,
+    `- Prefer rational next steps based on current shortages and infrastructure gaps.`,
+    `- The plan should reflect the bot's persona, but still be practical and efficient.`,
     ``,
     `IMPORTANT BUILD RULES (to ensure recognizable structures):`,
     `- A FORT must be simple and intentional: foundation, floor, doorway, full walls, and a roofline/battlements.`,
@@ -53,7 +168,18 @@ function buildMenuPrompt({ bot, humanMessage }) {
       `State: pos=${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)} health=${bot.health} food=${bot.food} night=${isNight}`
     );
   }
+
   if (invSummary) menu.push(`Inventory(top): ${invSummary}`);
+
+  if (worldSummary.length) {
+    menu.push("", "Persistent world summary (important):");
+    for (const line of worldSummary) menu.push(`- ${line}`);
+  }
+
+  if (resourceGaps.length) {
+    menu.push("", "Resource / infrastructure gap analysis (important):");
+    for (const line of resourceGaps) menu.push(`- ${line}`);
+  }
 
   const fails = recentFailuresFor(bot.username, 20 * 60 * 1000, 5);
   if (fails.length) {

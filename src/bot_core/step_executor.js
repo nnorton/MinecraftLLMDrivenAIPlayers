@@ -1,7 +1,7 @@
 // src/bot_core/step_executor.js
 
 const { wander, follow, goto } = require("../actions/movement");
-const { getBase, setBase } = require("../actions/memory");
+const { getBase, setBase, recordStructure, recordFarm } = require("../actions/memory");
 const { buildFort, buildMonument, buildMonumentComplex } = require("../actions/build");
 const { craftTools, smeltOre } = require("../actions/craft");
 const { fightMobs } = require("../actions/combat");
@@ -12,6 +12,15 @@ const { normalizeType } = require("./utils");
 
 function isMovementType(type) {
   return type === "WANDER" || type === "GOTO" || type === "FOLLOW";
+}
+
+function requestedUtilities(step) {
+  const out = [];
+  if (step?.includeBed) out.push("bed");
+  if (step?.includeStorage) out.push("storage");
+  if (step?.includeCrafting) out.push("crafting");
+  if (step?.includeFurnace) out.push("furnace");
+  return out;
 }
 
 async function executeStep({ bot, step, safeChat, config }) {
@@ -103,19 +112,35 @@ async function executeStep({ bot, step, safeChat, config }) {
       step.max ?? 12,
       step.radius ?? undefined
     );
+
+    try {
+      recordFarm(bot, {
+        mode: "harvest",
+        crops: step.crops ?? ["wheat", "carrots", "potatoes"],
+        size: step.size,
+      });
+    } catch {}
+
     return { status: "done" };
   }
 
   if (type === "FARM") {
     const res = await simpleFarm(bot, step);
 
-    if (res?.ok) return { status: "done" };
+    if (res?.ok) {
+      try {
+        recordFarm(bot, {
+          mode: res.mode || "farm",
+          crops: step.crops ?? (res.crop ? [res.crop] : []),
+          size: step.size,
+        });
+      } catch {}
+      return { status: "done" };
+    }
 
-    // If FARM couldn’t do anything, avoid hammering FARM in a tight loop.
     bot._cooldowns = bot._cooldowns || {};
-    bot._cooldowns.FARM = Date.now() + 60 * 1000; // 60s
+    bot._cooldowns.FARM = Date.now() + 60 * 1000;
 
-    // Requeue a productive fallback instead of retrying FARM immediately.
     return {
       status: "requeue",
       newQueue: [
@@ -127,17 +152,48 @@ async function executeStep({ bot, step, safeChat, config }) {
   }
 
   if (type === "BUILD_STRUCTURE") {
-    await buildFort(bot, step);
+    const res = await buildFort(bot, step);
+
+    try {
+      recordStructure(bot, {
+        kind: res?.kind || step.kind || "FORT",
+        material: res?.material || step.material,
+        size: step.size,
+        height: step.height,
+        utilities: requestedUtilities(step),
+      });
+    } catch {}
+
     return { status: "done" };
   }
 
   if (type === "BUILD_MONUMENT") {
-    await buildMonument(bot, step);
+    const res = await buildMonument(bot, step);
+
+    try {
+      recordStructure(bot, {
+        kind: "MONUMENT",
+        material: step.material || res?.material,
+        height: step.height,
+        size: 7,
+      });
+    } catch {}
+
     return { status: "done" };
   }
 
   if (type === "BUILD_MONUMENT_COMPLEX") {
-    await buildMonumentComplex(bot, step.kind || "OBELISK", step);
+    const res = await buildMonumentComplex(bot, step.kind || "OBELISK", step);
+
+    try {
+      recordStructure(bot, {
+        kind: step.kind || "OBELISK",
+        material: step.material || res?.material,
+        height: step.height,
+        size: 7,
+      });
+    } catch {}
+
     return { status: "done" };
   }
 

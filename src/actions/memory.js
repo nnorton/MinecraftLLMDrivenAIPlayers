@@ -9,24 +9,60 @@ function memPath(botName) {
   return path.join(MEM_DIR, `${botName}.json`);
 }
 
+function defaultMemory() {
+  return {
+    base: null,
+    build_sites: {},
+    storage: { chest: null },
+    structures: [],
+    farms: [],
+    activity: {
+      buildsCompleted: 0,
+      farmsStarted: 0,
+      harvestRuns: 0,
+      lastStructureKind: null,
+      lastFarmCrops: [],
+      updatedAt: null,
+    },
+  };
+}
+
+function normalizeMemoryShape(maybeMem) {
+  const mem = maybeMem && typeof maybeMem === "object" ? maybeMem : defaultMemory();
+
+  if (!("base" in mem)) mem.base = null;
+  if (!mem.build_sites || typeof mem.build_sites !== "object") mem.build_sites = {};
+  if (!mem.storage || typeof mem.storage !== "object") mem.storage = { chest: null };
+  if (!("chest" in mem.storage)) mem.storage.chest = null;
+  if (!Array.isArray(mem.structures)) mem.structures = [];
+  if (!Array.isArray(mem.farms)) mem.farms = [];
+  if (!mem.activity || typeof mem.activity !== "object") mem.activity = defaultMemory().activity;
+
+  if (!Number.isFinite(mem.activity.buildsCompleted)) mem.activity.buildsCompleted = 0;
+  if (!Number.isFinite(mem.activity.farmsStarted)) mem.activity.farmsStarted = 0;
+  if (!Number.isFinite(mem.activity.harvestRuns)) mem.activity.harvestRuns = 0;
+  if (!Array.isArray(mem.activity.lastFarmCrops)) mem.activity.lastFarmCrops = [];
+  if (!("lastStructureKind" in mem.activity)) mem.activity.lastStructureKind = null;
+  if (!("updatedAt" in mem.activity)) mem.activity.updatedAt = null;
+
+  return mem;
+}
+
 function loadMemory(botName) {
   const p = memPath(botName);
-  if (!fs.existsSync(p)) return { base: null, build_sites: {}, storage: { chest: null } };
+  if (!fs.existsSync(p)) return defaultMemory();
   try {
     const m = JSON.parse(fs.readFileSync(p, "utf8"));
-    if (!m || typeof m !== "object") return { base: null, build_sites: {}, storage: { chest: null } };
-    if (!m.build_sites || typeof m.build_sites !== "object") m.build_sites = {};
-    if (!("base" in m)) m.base = null;
-    if (!m.storage || typeof m.storage !== "object") m.storage = { chest: null };
-    if (!("chest" in m.storage)) m.storage.chest = null;
-    return m;
+    return normalizeMemoryShape(m);
   } catch {
-    return { base: null, build_sites: {}, storage: { chest: null } };
+    return defaultMemory();
   }
 }
 
 function saveMemory(botName, mem) {
-  fs.writeFileSync(memPath(botName), JSON.stringify(mem, null, 2));
+  const normalized = normalizeMemoryShape(mem);
+  normalized.activity.updatedAt = new Date().toISOString();
+  fs.writeFileSync(memPath(botName), JSON.stringify(normalized, null, 2));
 }
 
 function toBlockPos(pos) {
@@ -38,12 +74,25 @@ function toBlockPos(pos) {
   return { x, y, z };
 }
 
-/**
- * Set the bot's "base" position.
- * Compatible with older callers:
- * - setBase(bot) uses bot.entity.position
- * - setBase(bot, {x,y,z}) uses the provided position
- */
+function samePos(a, b) {
+  if (!a || !b) return false;
+  return a.x === b.x && a.y === b.y && a.z === b.z;
+}
+
+function nearPos(a, b, radius = 4) {
+  if (!a || !b) return false;
+  return Math.abs(a.x - b.x) <= radius && Math.abs(a.y - b.y) <= 2 && Math.abs(a.z - b.z) <= radius;
+}
+
+function compactPos(p) {
+  if (!p) return "unknown";
+  return `${p.x},${p.y},${p.z}`;
+}
+
+function uniqStrings(arr) {
+  return [...new Set((Array.isArray(arr) ? arr : []).map((x) => String(x || "").trim()).filter(Boolean))];
+}
+
 function setBase(bot, posOverride) {
   const mem = loadMemory(bot.username);
   const pos = posOverride ? posOverride : bot.entity?.position;
@@ -59,10 +108,6 @@ function getBase(bot) {
   return mem.base;
 }
 
-/**
- * Fixed build sites (persist across restarts).
- * Keys are strings like "FORT", "MONUMENT".
- */
 function setBuildSite(bot, key, posOverride) {
   const mem = loadMemory(bot.username);
   const k = String(key || "").trim().toUpperCase();
@@ -116,6 +161,136 @@ function setStorageChest(bot, posOverride) {
   return p;
 }
 
+function recordStructure(bot, details = {}) {
+  const mem = loadMemory(bot.username);
+  const pos = toBlockPos(details.pos || bot.entity?.position);
+  const kind = String(details.kind || "STRUCTURE").trim().toUpperCase();
+  const material = details.material ? String(details.material).trim() : null;
+  const size = Number.isFinite(details.size) ? Math.floor(details.size) : null;
+  const height = Number.isFinite(details.height) ? Math.floor(details.height) : null;
+  const utilities = uniqStrings(details.utilities || []);
+  const now = new Date().toISOString();
+
+  const existing = mem.structures.find(
+    (s) => String(s?.kind || "").toUpperCase() === kind && (samePos(s.pos, pos) || nearPos(s.pos, pos, 5))
+  );
+
+  if (existing) {
+    existing.pos = pos || existing.pos || null;
+    existing.material = material || existing.material || null;
+    existing.size = size || existing.size || null;
+    existing.height = height || existing.height || null;
+    existing.utilities = uniqStrings([...(existing.utilities || []), ...utilities]);
+    existing.lastBuiltAt = now;
+    existing.timesBuilt = Number.isFinite(existing.timesBuilt) ? existing.timesBuilt + 1 : 2;
+  } else {
+    mem.structures.push({
+      kind,
+      pos,
+      material,
+      size,
+      height,
+      utilities,
+      firstBuiltAt: now,
+      lastBuiltAt: now,
+      timesBuilt: 1,
+    });
+  }
+
+  mem.structures = mem.structures.slice(-12);
+  mem.activity.buildsCompleted += 1;
+  mem.activity.lastStructureKind = kind;
+  saveMemory(bot.username, mem);
+  return mem.structures[mem.structures.length - 1] || existing || null;
+}
+
+function recordFarm(bot, details = {}) {
+  const mem = loadMemory(bot.username);
+  const pos = toBlockPos(details.pos || bot.entity?.position);
+  const crops = uniqStrings(details.crops || (details.crop ? [details.crop] : []));
+  const size = Number.isFinite(details.size) ? Math.floor(details.size) : null;
+  const mode = String(details.mode || "farm").trim().toLowerCase();
+  const now = new Date().toISOString();
+
+  const existing = mem.farms.find((f) => samePos(f.pos, pos) || nearPos(f.pos, pos, 6));
+  if (existing) {
+    existing.pos = pos || existing.pos || null;
+    existing.crops = uniqStrings([...(existing.crops || []), ...crops]);
+    existing.size = size || existing.size || null;
+    existing.lastWorkedAt = now;
+    existing.mode = mode || existing.mode || "farm";
+    existing.timesWorked = Number.isFinite(existing.timesWorked) ? existing.timesWorked + 1 : 2;
+  } else {
+    mem.farms.push({
+      pos,
+      crops,
+      size,
+      mode,
+      firstWorkedAt: now,
+      lastWorkedAt: now,
+      timesWorked: 1,
+    });
+  }
+
+  mem.farms = mem.farms.slice(-10);
+  if (mode === "create" || mode === "farm") mem.activity.farmsStarted += 1;
+  if (mode === "harvest") mem.activity.harvestRuns += 1;
+  mem.activity.lastFarmCrops = crops;
+  saveMemory(bot.username, mem);
+  return mem.farms[mem.farms.length - 1] || existing || null;
+}
+
+function getWorldSummary(bot) {
+  const mem = loadMemory(bot.username);
+  const lines = [];
+
+  if (mem.base) lines.push(`Base: ${compactPos(mem.base)}`);
+  if (mem.storage?.chest) lines.push(`Storage chest: ${compactPos(mem.storage.chest)}`);
+
+  const structureBits = (mem.structures || []).slice(-6).map((s) => {
+    const parts = [String(s.kind || "STRUCTURE").toUpperCase()];
+    if (s.size) parts.push(`size=${s.size}`);
+    if (s.height) parts.push(`height=${s.height}`);
+    if (s.material) parts.push(`material=${s.material}`);
+    if (Array.isArray(s.utilities) && s.utilities.length) parts.push(`utilities=${s.utilities.join("/")}`);
+    if (s.pos) parts.push(`at ${compactPos(s.pos)}`);
+    return parts.join(" ");
+  });
+  if (structureBits.length) lines.push(`Built structures: ${structureBits.join("; ")}`);
+
+  const farmBits = (mem.farms || []).slice(-4).map((f) => {
+    const parts = [];
+    if (Array.isArray(f.crops) && f.crops.length) parts.push(f.crops.join("/"));
+    else parts.push("unknown_crops");
+    if (f.size) parts.push(`size=${f.size}`);
+    if (f.mode) parts.push(`mode=${f.mode}`);
+    if (f.pos) parts.push(`at ${compactPos(f.pos)}`);
+    return parts.join(" ");
+  });
+  if (farmBits.length) lines.push(`Known farms: ${farmBits.join("; ")}`);
+
+  const siteEntries = Object.entries(mem.build_sites || {});
+  if (siteEntries.length) {
+    lines.push(
+      `Reserved build sites: ${siteEntries
+        .slice(0, 6)
+        .map(([k, p]) => `${k}@${compactPos(p)}`)
+        .join(", ")}`
+    );
+  }
+
+  const act = mem.activity || {};
+  const stats = [];
+  if (Number.isFinite(act.buildsCompleted)) stats.push(`buildsCompleted=${act.buildsCompleted}`);
+  if (Number.isFinite(act.farmsStarted)) stats.push(`farmsStarted=${act.farmsStarted}`);
+  if (Number.isFinite(act.harvestRuns)) stats.push(`harvestRuns=${act.harvestRuns}`);
+  if (act.lastStructureKind) stats.push(`lastStructure=${act.lastStructureKind}`);
+  if (Array.isArray(act.lastFarmCrops) && act.lastFarmCrops.length) stats.push(`lastFarmCrops=${act.lastFarmCrops.join("/")}`);
+  if (stats.length) lines.push(`Progress memory: ${stats.join(", ")}`);
+
+  return lines;
+}
+
 module.exports = {
   loadMemory,
   saveMemory,
@@ -126,4 +301,7 @@ module.exports = {
   clearBuildSite,
   getStorageChest,
   setStorageChest,
+  recordStructure,
+  recordFarm,
+  getWorldSummary,
 };
